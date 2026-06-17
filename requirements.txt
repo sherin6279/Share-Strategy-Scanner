@@ -1,0 +1,13 @@
+streamlit>=1.32.0
+kiteconnect>=5.0.0
+duckdb>=0.10.0
+pandas>=2.1.0
+numpy>=1.26.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+openpyxl>=3.1.0
+pandas-ta>=0.3.14b
+
+# Optional: install TA-Lib separately for better performance
+# brew install ta-lib  (macOS)
+# pip install TA-Lib

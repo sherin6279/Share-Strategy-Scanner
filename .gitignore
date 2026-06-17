@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+data/market.duckdb
+data/market.duckdb.wal
+data_cache/
+logs/
+*.xlsx
+.DS_Store
