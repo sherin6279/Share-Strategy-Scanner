@@ -26,12 +26,14 @@ MAX_REQUESTS_PER_SEC: int = 3
 RETRY_COUNT: int = 3
 
 # Data parameters
-CANDLE_DAYS: int = 260
+CANDLE_DAYS: int = 260  # Initial backfill trading days per symbol (DB grows beyond this)
 NIFTY50_SYMBOL: str = "NIFTY 50"
 
 # Strategy thresholds
 MIN_TRADED_VALUE_CR_S1: float = 10.0  # ₹10 crore (Strategy 3)
 MIN_TRADED_VALUE_CR_S6: float = 20.0  # ₹20 crore (Strategy 6)
+RS_LEADERS_MAX_PICKS: int = 5  # Top N RS Leaders per scan day
+MAX_SHARE_PRICE_INR: float = 10_000.0  # Paper portfolio: skip 1-share picks above this price
 
 # Performance
 SCAN_THREAD_WORKERS: int = 8

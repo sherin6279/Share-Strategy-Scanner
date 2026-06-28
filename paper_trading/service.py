@@ -9,10 +9,16 @@ from typing import Any
 
 import pandas as pd
 
+from config.settings import MAX_SHARE_PRICE_INR, RS_LEADERS_MAX_PICKS
 from database.duckdb_manager import DuckDBManager
+from scanners.signal_filters import apply_scan_df_filters
+from strategies.strategy_6_relative_strength_leaders import STRATEGY_ID as RS_LEADERS_ID
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+RS_CLEANUP_METADATA_KEY = "portfolio_rs_top5_cleanup_done"
+MAX_PRICE_CLEANUP_METADATA_KEY = "portfolio_max_share_price_cleanup_done"
 
 STRATEGY_NAMES = {
     1: "Basic Breakout",
@@ -34,38 +40,113 @@ class PaperTradingService:
     def __init__(self, db: DuckDBManager | None = None) -> None:
         self.db = db or DuckDBManager()
 
+    def run_one_time_rs_cleanup(self) -> dict[str, Any]:
+        """
+        One-time removal of RS-only holdings beyond top N per purchase date.
+
+        Confluence picks are kept. Safe to call repeatedly — runs once only.
+        """
+        if self.db.get_metadata(RS_CLEANUP_METADATA_KEY) == "true":
+            return {"removed": 0, "already_done": True}
+
+        removed = self._cleanup_excess_rs_leader_holdings()
+        self.db.set_metadata(RS_CLEANUP_METADATA_KEY, "true")
+        logger.info("RS Leaders cleanup removed %d excess holdings", removed)
+        return {"removed": removed, "already_done": False}
+
+    def _cleanup_excess_rs_leader_holdings(self) -> int:
+        holdings = self.db.list_portfolio_holdings()
+        if holdings.empty:
+            return 0
+
+        rs_only = holdings[
+            (holdings["source_type"] == STRATEGY_TYPE)
+            & (holdings["source_label"] == STRATEGY_NAMES[RS_LEADERS_ID])
+        ].copy()
+        if rs_only.empty:
+            return 0
+
+        rs_only["purchase_date"] = pd.to_datetime(rs_only["purchase_date"]).dt.date
+        to_delete: list[str] = []
+        for _, grp in rs_only.groupby("purchase_date", sort=False):
+            ranked = grp.sort_values("score", ascending=False, na_position="last")
+            excess = ranked.iloc[RS_LEADERS_MAX_PICKS:]
+            to_delete.extend(excess["holding_id"].astype(str).tolist())
+
+        return self.db.delete_portfolio_holdings(to_delete)
+
+    def run_one_time_max_price_cleanup(self) -> dict[str, Any]:
+        """
+        One-time removal of holdings bought above MAX_SHARE_PRICE_INR.
+
+        Safe to call repeatedly — runs once only.
+        """
+        if self.db.get_metadata(MAX_PRICE_CLEANUP_METADATA_KEY) == "true":
+            return {"removed": 0, "already_done": True}
+
+        holdings = self.db.list_portfolio_holdings()
+        if holdings.empty:
+            self.db.set_metadata(MAX_PRICE_CLEANUP_METADATA_KEY, "true")
+            return {"removed": 0, "already_done": False}
+
+        expensive = holdings[holdings["purchase_price"] > MAX_SHARE_PRICE_INR]
+        to_delete = expensive["holding_id"].astype(str).tolist()
+        removed = self.db.delete_portfolio_holdings(to_delete)
+        self.db.set_metadata(MAX_PRICE_CLEANUP_METADATA_KEY, "true")
+        logger.info(
+            "Max-price cleanup removed %d holdings above ₹%.0f",
+            removed,
+            MAX_SHARE_PRICE_INR,
+        )
+        return {"removed": removed, "already_done": False}
+
     def sync_portfolio_from_scans(self) -> dict[str, Any]:
         """
         Import all historical equity scans into the portfolio.
 
         Skips scans already processed and symbols already held on the same date.
         """
+        rs_cleanup = self.run_one_time_rs_cleanup()
+        price_cleanup = self.run_one_time_max_price_cleanup()
         removed = self.db.dedupe_portfolio_holdings()
         runs = self.db.list_equity_scan_runs_chronological()
         scans_processed = 0
         total_added = 0
         skipped_scans = 0
+        empty_scans = 0
 
         for run in runs:
             run_id = run.get("run_id")
+            scan_ts = run.get("scan_timestamp")
             if not run_id:
-                continue
+                if scan_ts is None:
+                    continue
+                run_id = f"legacy_{pd.Timestamp(scan_ts).strftime('%Y%m%d_%H%M%S')}"
             if self.db.portfolio_scan_processed(run_id):
                 skipped_scans += 1
                 continue
-            result = self.record_from_scan(run_id)
+            result = self.record_from_scan(run_id, scan_timestamp=scan_ts)
             scans_processed += 1
             total_added += result.get("holdings_added", 0)
+            if result.get("empty_scan"):
+                empty_scans += 1
 
         return {
             "scans_processed": scans_processed,
             "scans_skipped": skipped_scans,
+            "empty_scans": empty_scans,
             "holdings_added": total_added,
             "duplicates_removed": removed,
+            "rs_cleanup_removed": rs_cleanup.get("removed", 0),
+            "max_price_cleanup_removed": price_cleanup.get("removed", 0),
             "total_holdings": self.db.count_portfolio_holdings(),
         }
 
-    def record_from_scan(self, scan_run_id: str) -> dict[str, Any]:
+    def record_from_scan(
+        self,
+        scan_run_id: str,
+        scan_timestamp: datetime | None = None,
+    ) -> dict[str, Any]:
         """
         Buy 1 share of each unique scan pick at the signal-day close.
 
@@ -85,9 +166,21 @@ class PaperTradingService:
                 "already_recorded": True,
             }
 
-        scan_df = self.db.get_scan_results(scan_run_id=scan_run_id)
+        scan_df = self.db.get_scan_results(
+            scan_run_id=scan_run_id, scan_timestamp=scan_timestamp
+        )
+        scan_df = apply_scan_df_filters(scan_df)
         if scan_df.empty:
-            raise RuntimeError(f"No scan results found for run {scan_run_id}")
+            logger.warning("No scan results for run %s — marking as processed", scan_run_id)
+            self.db.log_portfolio_scan(scan_run_id, datetime.now(), 0)
+            return {
+                "scan_run_id": scan_run_id,
+                "holdings_added": 0,
+                "holdings_skipped_duplicate": 0,
+                "holdings_count": 0,
+                "already_recorded": False,
+                "empty_scan": True,
+            }
 
         created_at = datetime.now()
         candidates = self._build_holdings_from_scan(scan_df, scan_run_id, created_at)
@@ -264,21 +357,30 @@ class PaperTradingService:
             }
 
         priced = df[df["pl_amount"].notna()]
+        unpriced_count = len(df) - len(priced)
         total_cost = float(df["cost_basis"].sum())
+        priced_cost = float(priced["cost_basis"].sum()) if len(priced) else 0.0
         total_mv = float(priced["market_value"].sum()) if len(priced) else 0.0
         total_pl = float(priced["pl_amount"].sum()) if len(priced) else 0.0
         winners = int((priced["pl_amount"] > 0).sum())
         losers = int((priced["pl_amount"] < 0).sum())
+        flat = int((priced["pl_amount"] == 0).sum())
         win_rate = (winners / len(priced) * 100.0) if len(priced) else None
+        avg_pl_pct = float(priced["pl_pct"].mean()) if len(priced) else None
 
         return {
             "holding_count": len(df),
+            "priced_count": len(priced),
+            "unpriced_count": unpriced_count,
             "total_cost": total_cost,
+            "priced_cost": priced_cost,
             "total_market_value": total_mv,
             "total_pl_amount": total_pl,
-            "total_pl_pct": (total_pl / total_cost * 100.0) if total_cost else None,
+            "total_pl_pct": (total_pl / priced_cost * 100.0) if priced_cost else None,
+            "avg_holding_pl_pct": avg_pl_pct,
             "winners": winners,
             "losers": losers,
+            "flat": flat,
             "win_rate": win_rate,
             "latest_price_date": priced["current_date"].max() if len(priced) else None,
             "symbols": df["symbol"].nunique(),
@@ -299,10 +401,17 @@ class PaperTradingService:
                     "purchase_date": purchase_date,
                     "holdings": len(grp),
                     "invested": cost,
+                    "priced_cost": float(priced["cost_basis"].sum()) if len(priced) else 0.0,
                     "market_value": float(priced["market_value"].sum()) if len(priced) else 0.0,
                     "pl_amount": pl,
-                    "pl_pct": (pl / cost * 100.0) if cost else None,
+                    "pl_pct": (
+                        (pl / float(priced["cost_basis"].sum()) * 100.0)
+                        if len(priced) and priced["cost_basis"].sum()
+                        else None
+                    ),
+                    "avg_pl_pct": float(priced["pl_pct"].mean()) if len(priced) else None,
                     "winners": int((priced["pl_amount"] > 0).sum()) if len(priced) else 0,
+                    "losers": int((priced["pl_amount"] < 0).sum()) if len(priced) else 0,
                 }
             )
         out = pd.DataFrame(rows)
@@ -317,6 +426,7 @@ class PaperTradingService:
         for strategy, grp in df.groupby("strategy_group", sort=False):
             priced = grp[grp["pl_amount"].notna()]
             cost = float(grp["cost_basis"].sum())
+            priced_cost = float(priced["cost_basis"].sum()) if len(priced) else 0.0
             pl = float(priced["pl_amount"].sum()) if len(priced) else 0.0
             rows.append(
                 {
@@ -325,7 +435,8 @@ class PaperTradingService:
                     "invested": cost,
                     "market_value": float(priced["market_value"].sum()) if len(priced) else 0.0,
                     "pl_amount": pl,
-                    "pl_pct": (pl / cost * 100.0) if cost else None,
+                    "pl_pct": (pl / priced_cost * 100.0) if priced_cost else None,
+                    "avg_pl_pct": float(priced["pl_pct"].mean()) if len(priced) else None,
                     "win_rate": (
                         float((priced["pl_amount"] > 0).mean() * 100.0) if len(priced) else None
                     ),

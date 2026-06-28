@@ -151,6 +151,34 @@ class DuckDBManager:
         self.conn.unregister("_candles_tmp")
         return len(clean)
 
+    def get_latest_candle_dates(self, symbols: list[str] | None = None) -> dict[str, date]:
+        """Return the most recent stored trade_date per symbol."""
+        if symbols:
+            placeholders = ", ".join(["?"] * len(symbols))
+            df = self.conn.execute(
+                f"""
+                SELECT symbol, MAX(trade_date) AS trade_date
+                FROM candles
+                WHERE symbol IN ({placeholders})
+                GROUP BY symbol
+                """,
+                symbols,
+            ).fetchdf()
+        else:
+            df = self.conn.execute(
+                """
+                SELECT symbol, MAX(trade_date) AS trade_date
+                FROM candles
+                GROUP BY symbol
+                """
+            ).fetchdf()
+
+        if df.empty:
+            return {}
+
+        df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+        return dict(zip(df["symbol"], df["trade_date"], strict=False))
+
     def get_all_symbols(self) -> list[str]:
         rows = self.conn.execute(
             "SELECT DISTINCT symbol FROM candles ORDER BY symbol"
@@ -687,6 +715,16 @@ class DuckDBManager:
     def count_portfolio_holdings(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) FROM portfolio_holdings").fetchone()
         return int(row[0]) if row else 0
+
+    def delete_portfolio_holdings(self, holding_ids: list[str]) -> int:
+        if not holding_ids:
+            return 0
+        placeholders = ", ".join(["?"] * len(holding_ids))
+        self.conn.execute(
+            f"DELETE FROM portfolio_holdings WHERE holding_id IN ({placeholders})",
+            holding_ids,
+        )
+        return len(holding_ids)
 
     def insert_paper_trade_batch(
         self,

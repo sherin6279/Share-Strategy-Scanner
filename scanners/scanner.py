@@ -9,6 +9,7 @@ from datetime import datetime
 import pandas as pd
 
 from database.duckdb_manager import DuckDBManager
+from scanners.signal_filters import apply_scan_df_filters, apply_signal_filters
 from strategies.strategy_engine import StrategyEngine
 from utils.logger import get_logger
 
@@ -37,6 +38,7 @@ class Scanner:
             raise RuntimeError("No candle data in database. Run Refresh Market Data first.")
 
         signals, scan_time = self.engine.run(candles_map)
+        signals = apply_signal_filters(signals)
         run_id = uuid.uuid4().hex[:16]
         records = StrategyEngine.signals_to_records(
             signals, scan_time, scan_run_id=run_id
@@ -88,9 +90,11 @@ class Scanner:
         )
         if df.empty:
             return df
-        return df[df["strategy_id"] == strategy_id].sort_values(
+        df = apply_scan_df_filters(df)
+        result = df[df["strategy_id"] == strategy_id].sort_values(
             "score", ascending=False
         ).reset_index(drop=True)
+        return result
 
     def get_confluence(
         self,
@@ -104,6 +108,8 @@ class Scanner:
         )
         if df.empty:
             return pd.DataFrame()
+
+        df = apply_scan_df_filters(df)
 
         strategy_names = {
             1: "Basic Breakout",

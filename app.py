@@ -12,7 +12,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from config.settings import KITE_ACCESS_TOKEN, KITE_API_KEY, KITE_API_SECRET, NIFTY50_SYMBOL
+from config.settings import KITE_ACCESS_TOKEN, KITE_API_KEY, KITE_API_SECRET, NIFTY50_SYMBOL, RS_LEADERS_MAX_PICKS
 from data.kite_fetcher import KiteFetcher
 from data.refresh_service import RefreshService
 from database.duckdb_manager import DuckDBManager
@@ -224,10 +224,17 @@ def _run_refresh(db: DuckDBManager) -> None:
     progress = st.progress(0, text="Starting refresh...")
     status = st.empty()
 
-    def callback(current: int, total: int, symbol: str) -> None:
+    def callback(current: int, total: int, symbol: str, status: str = "updating") -> None:
         pct = current / total
-        progress.progress(pct, text=f"Fetching {current} / {total} — {symbol}")
-        status.caption(f"Current: {symbol}")
+        labels = {
+            "skipped": "Skipping (current)",
+            "backfill": "Backfilling",
+            "updating": "Updating",
+            "failed": "Failed",
+        }
+        label = labels.get(status, "Fetching")
+        progress.progress(pct, text=f"{label} {current} / {total} — {symbol}")
+        status.caption(f"{label}: {symbol}")
 
     try:
         service = RefreshService(db=db, fetcher=fetcher)
@@ -238,22 +245,30 @@ def _run_refresh(db: DuckDBManager) -> None:
         progress.progress(1.0, text="Refresh complete!")
         st.session_state.refresh_summary = summary
 
-        fetched = summary["symbols_fetched"]
+        updated = summary["symbols_updated"]
+        skipped = summary.get("symbols_skipped", 0)
         n_failed = summary["symbols_failed"]
+        rows = summary.get("rows_upserted", 0)
         elapsed_msg = f"{elapsed:.1f}s"
 
-        if fetched == 0:
+        if updated == 0 and n_failed == 0 and skipped > 0:
+            st.success(
+                f"All {skipped} symbols already up to date in {elapsed_msg}."
+            )
+        elif updated == 0 and n_failed > 0:
             st.error(
-                f"Refresh failed — 0 symbols fetched ({n_failed} failed) in {elapsed_msg}. "
+                f"Refresh failed — 0 symbols updated ({n_failed} failed) in {elapsed_msg}. "
                 "Your access token is likely expired. Use 'Verify Token' or re-login via the sidebar."
             )
         elif n_failed > 10:
             st.warning(
-                f"Partial refresh: {fetched} symbols fetched, {n_failed} failed in {elapsed_msg}"
+                f"Partial refresh: {updated} updated, {skipped} skipped, "
+                f"{n_failed} failed, {rows:,} candles in {elapsed_msg}"
             )
         else:
             st.success(
-                f"Fetched {fetched} symbols ({n_failed} failed) in {elapsed_msg}"
+                f"Updated {updated} symbols, skipped {skipped} (already current), "
+                f"{n_failed} failed, {rows:,} new candles in {elapsed_msg}"
             )
 
         if summary["failed_symbols"]:
@@ -338,6 +353,12 @@ def render_strategy_tab(
     if strategy_id in (4, 5, 6, 7) and not market_uptrend:
         st.warning(
             "NIFTY 50 is below its 200-day SMA — review these picks with extra caution"
+        )
+
+    if strategy_id == 6:
+        st.caption(
+            f"Top **{RS_LEADERS_MAX_PICKS}** RS Leaders by score — "
+            "only these are saved to your portfolio."
         )
 
     df = scanner.get_results_by_strategy(

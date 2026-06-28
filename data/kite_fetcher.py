@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Callable
 
 import pandas as pd
@@ -22,6 +22,8 @@ from utils.helpers import ensure_ohlcv
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+CANDLE_COLUMNS = ["symbol", "trade_date", "open", "high", "low", "close", "volume"]
 
 
 class KiteFetcher:
@@ -101,16 +103,13 @@ class KiteFetcher:
         """Get instrument token for NSE tradingsymbol."""
         return self._instrument_map.get(symbol)
 
-    def fetch_historical(
+    def _fetch_historical_records(
         self,
         symbol: str,
         instrument_token: int,
-        days: int = CANDLE_DAYS,
+        from_date: datetime,
+        to_date: datetime,
     ) -> pd.DataFrame:
-        """Fetch daily candles with retry logic."""
-        to_date = datetime.now()
-        from_date = to_date - timedelta(days=int(days * 1.6))  # buffer for holidays
-
         for attempt in range(1, RETRY_COUNT + 1):
             try:
                 self._rate_limit()
@@ -127,10 +126,7 @@ class KiteFetcher:
                 df = df.rename(columns={"date": "trade_date"})
                 df["symbol"] = symbol
                 df = ensure_ohlcv(df)
-                # Keep only last `days` candles
-                if len(df) > days:
-                    df = df.iloc[-days:].reset_index(drop=True)
-                return df[["symbol", "trade_date", "open", "high", "low", "close", "volume"]]
+                return df[CANDLE_COLUMNS]
 
             except Exception as exc:
                 logger.warning(
@@ -144,6 +140,33 @@ class KiteFetcher:
                     time.sleep(REQUEST_DELAY_SEC * attempt)
 
         return pd.DataFrame()
+
+    def fetch_historical(
+        self,
+        symbol: str,
+        instrument_token: int,
+        days: int = CANDLE_DAYS,
+    ) -> pd.DataFrame:
+        """Fetch an initial backfill of daily candles with retry logic."""
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=int(days * 1.6))  # buffer for holidays
+        df = self._fetch_historical_records(symbol, instrument_token, from_date, to_date)
+        if df.empty:
+            return df
+
+        if len(df) > days:
+            df = df.iloc[-days:].reset_index(drop=True)
+        return df
+
+    def fetch_historical_range(
+        self,
+        symbol: str,
+        instrument_token: int,
+        from_date: datetime,
+        to_date: datetime,
+    ) -> pd.DataFrame:
+        """Fetch daily candles for an explicit date range (incremental updates)."""
+        return self._fetch_historical_records(symbol, instrument_token, from_date, to_date)
 
     def fetch_all_symbols(
         self,
@@ -166,7 +189,6 @@ class KiteFetcher:
         total = len(all_symbols)
         results: list[pd.DataFrame] = []
         failed: list[str] = []
-        _AUTH_ERRORS = ("incorrect", "invalid", "expired", "unauthorised", "unauthorized")
 
         for i, symbol in enumerate(all_symbols, start=1):
             if progress_callback:
@@ -181,20 +203,16 @@ class KiteFetcher:
             df = self.fetch_historical(symbol, token)
             if df.empty:
                 failed.append(symbol)
-                # Fast-fail: if the first real fetch fails, check whether the
-                # token itself is the problem before burning time on all symbols.
-                if i == 1:
-                    last_log = logger.handlers  # already logged in fetch_historical
-                    if not self.validate_token():
-                        remaining = all_symbols[i:]
-                        logger.error(
-                            "Access token is invalid or expired. "
-                            "Aborting fetch — %d symbols skipped. "
-                            "Generate a fresh token via the Kite login flow.",
-                            len(remaining),
-                        )
-                        failed.extend(remaining)
-                        return results, failed
+                if i == 1 and not self.validate_token():
+                    remaining = all_symbols[i:]
+                    logger.error(
+                        "Access token is invalid or expired. "
+                        "Aborting fetch — %d symbols skipped. "
+                        "Generate a fresh token via the Kite login flow.",
+                        len(remaining),
+                    )
+                    failed.extend(remaining)
+                    return results, failed
             else:
                 results.append(df)
 
