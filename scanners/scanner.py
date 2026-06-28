@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import uuid
 from datetime import datetime
 
 import pandas as pd
@@ -35,33 +37,71 @@ class Scanner:
             raise RuntimeError("No candle data in database. Run Refresh Market Data first.")
 
         signals, scan_time = self.engine.run(candles_map)
-        records = StrategyEngine.signals_to_records(signals, scan_time)
+        run_id = uuid.uuid4().hex[:16]
+        records = StrategyEngine.signals_to_records(
+            signals, scan_time, scan_run_id=run_id
+        )
 
-        self.db.clear_scan_results()
         inserted = self.db.insert_scan_results(records)
+
+        strategy_counts: dict[int, int] = {}
+        for sig in signals:
+            strategy_counts[sig.strategy_id] = strategy_counts.get(sig.strategy_id, 0) + 1
+
+        self.db.insert_scan_run(
+            run_id,
+            scan_time,
+            "equity",
+            len(signals),
+            bool(self.engine.market_uptrend),
+            strategy_counts,
+        )
+        self.db.set_metadata("last_scan_run_id", run_id)
         self.db.set_metadata("last_scan_timestamp", scan_time.isoformat())
+        self.db.set_metadata(
+            "last_scan_market_uptrend",
+            "true" if self.engine.market_uptrend else "false",
+        )
+
+        self.db.set_metadata("last_scan_strategy_counts", json.dumps(strategy_counts))
 
         logger.info("Stored %d scan results", inserted)
 
         return {
+            "scan_run_id": run_id,
             "scan_timestamp": scan_time.isoformat(),
             "signal_count": len(signals),
+            "strategy_counts": strategy_counts,
             "strategy_3_paused": self.engine.strategy_3_paused,
-            "market_uptrend": self.engine.market_uptrend,
+            "market_uptrend": bool(self.engine.market_uptrend),
         }
 
-    def get_results_by_strategy(self, strategy_id: int) -> pd.DataFrame:
-        """Get latest scan results for a specific strategy."""
-        df = self.db.get_latest_scan_results()
+    def get_results_by_strategy(
+        self,
+        strategy_id: int,
+        scan_run_id: str | None = None,
+        scan_timestamp: datetime | None = None,
+    ) -> pd.DataFrame:
+        """Get scan results for a strategy from a specific scan run."""
+        df = self.db.get_scan_results(
+            scan_run_id=scan_run_id, scan_timestamp=scan_timestamp
+        )
         if df.empty:
             return df
         return df[df["strategy_id"] == strategy_id].sort_values(
             "score", ascending=False
         ).reset_index(drop=True)
 
-    def get_confluence(self, min_strategies: int = 2) -> pd.DataFrame:
+    def get_confluence(
+        self,
+        min_strategies: int = 2,
+        scan_run_id: str | None = None,
+        scan_timestamp: datetime | None = None,
+    ) -> pd.DataFrame:
         """Find stocks appearing in multiple strategies."""
-        df = self.db.get_latest_scan_results()
+        df = self.db.get_scan_results(
+            scan_run_id=scan_run_id, scan_timestamp=scan_timestamp
+        )
         if df.empty:
             return pd.DataFrame()
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Callable
 
 import pandas as pd
@@ -48,13 +48,18 @@ class StrategyEngine:
         enriched_map: dict[str, pd.DataFrame],
         idx_map: dict[str, int],
         nifty50_candles: pd.DataFrame | None,
+        nifty_eval_idx: int | None = None,
     ) -> dict[str, Any]:
         """Build shared context including RS rankings for strategy 6."""
         context: dict[str, Any] = {"nifty50_candles": nifty50_candles}
 
-        # Market regime for strategy 3
+        # Market regime — use aligned NIFTY index for historical replay
         if nifty50_candles is not None and len(nifty50_candles) > 0:
-            nifty_idx = len(nifty50_candles) - 1
+            nifty_idx = nifty_eval_idx
+            if nifty_idx is None:
+                nifty_idx = idx_map.get(NIFTY50_SYMBOL, len(nifty50_candles) - 1)
+            if nifty_idx < 0 or nifty_idx >= len(nifty50_candles):
+                nifty_idx = len(nifty50_candles) - 1
             row = nifty50_candles.iloc[nifty_idx]
             sma200 = row.get("sma200")
             self.market_uptrend = (
@@ -66,7 +71,7 @@ class StrategyEngine:
         self.strategy_3_paused = not self.market_uptrend
         context["market_uptrend"] = self.market_uptrend
 
-        # Cross-sectional return rankings for strategy 6
+        # Cross-sectional return rankings for strategy 6 (point-in-time via idx_map)
         ret_90 = compute_cross_sectional_returns(enriched_map, idx_map, 90)
         ret_180 = compute_cross_sectional_returns(enriched_map, idx_map, 180)
 
@@ -153,9 +158,56 @@ class StrategyEngine:
         )
         return all_signals, scan_time
 
+    def run_on_date(
+        self,
+        signal_date: date,
+        enriched_map: dict[str, pd.DataFrame],
+        idx_map: dict[str, int],
+    ) -> list[StrategySignal]:
+        """
+        Run all strategies as-of a historical signal date.
+
+        idx_map must map each symbol to its row index on signal_date.
+        """
+        if not idx_map:
+            return []
+
+        nifty50 = enriched_map.get(NIFTY50_SYMBOL)
+        nifty_eval_idx = idx_map.get(NIFTY50_SYMBOL)
+        context = self._build_context(
+            enriched_map, idx_map, nifty50, nifty_eval_idx=nifty_eval_idx
+        )
+
+        stock_symbols = [
+            s for s in idx_map if s != NIFTY50_SYMBOL and s in enriched_map
+        ]
+        all_signals: list[StrategySignal] = []
+
+        for sym in stock_symbols:
+            idx = idx_map[sym]
+            try:
+                all_signals.extend(
+                    self._evaluate_symbol(sym, enriched_map[sym], idx, context)
+                )
+            except Exception as exc:
+                logger.error("Evaluation failed for %s on %s: %s", sym, signal_date, exc)
+
+        return all_signals
+
+    @staticmethod
+    def enrich_all(candles_map: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        """Enrich all symbol candle series once for backtesting."""
+        return {
+            symbol: enrich_candles(df)
+            for symbol, df in candles_map.items()
+            if not df.empty
+        }
+
     @staticmethod
     def signals_to_records(
-        signals: list[StrategySignal], scan_timestamp: datetime
+        signals: list[StrategySignal],
+        scan_timestamp: datetime,
+        scan_run_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Convert signals to database-ready records."""
         records = []
@@ -165,6 +217,7 @@ class StrategyEngine:
                 metrics["suggested_action"] = sig.suggested_action
             records.append(
                 {
+                    "scan_run_id": scan_run_id,
                     "scan_timestamp": scan_timestamp,
                     "strategy_id": sig.strategy_id,
                     "symbol": sig.symbol,

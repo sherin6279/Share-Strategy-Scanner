@@ -36,6 +36,16 @@ MIN_TRADED_VALUE_CR_S6: float = 20.0  # ₹20 crore (Strategy 6)
 # Performance
 SCAN_THREAD_WORKERS: int = 8
 
+# Backtest defaults
+BACKTEST_HOLD_DAYS: int = 5
+BACKTEST_STEP_DAYS: int = 5
+BACKTEST_COST_BPS_EQUITY: float = 15.0
+BACKTEST_COST_BPS_FNO: float = 5.0
+
+# F&O intraday
+FNO_INTERVAL: str = "5minute"
+FNO_INTRADAY_DAYS: int = 30
+
 # Ensure directories exist
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)

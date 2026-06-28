@@ -20,20 +20,69 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 class DuckDBManager:
     """Manages local DuckDB storage for candles and scan results."""
 
-    def __init__(self, db_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path | None = None,
+        read_only: bool = False,
+    ) -> None:
         self.db_path = db_path or DB_PATH
+        self.read_only = read_only
         self._conn: duckdb.DuckDBPyConnection | None = None
+
+    def _open_connection(self) -> duckdb.DuckDBPyConnection:
+        try:
+            if self.read_only:
+                return duckdb.connect(str(self.db_path), read_only=True)
+            return duckdb.connect(str(self.db_path))
+        except duckdb.IOException as exc:
+            if "Conflicting lock" in str(exc):
+                raise RuntimeError(
+                    "Database is locked by another process (usually a running "
+                    f"Streamlit app). Stop it first, then retry.\n"
+                    f"  DB: {self.db_path}\n"
+                    f"  Check: lsof {self.db_path}"
+                ) from exc
+            raise
 
     @property
     def conn(self) -> duckdb.DuckDBPyConnection:
         if self._conn is None:
-            self._conn = duckdb.connect(str(self.db_path))
-            self._initialize_schema()
+            self._conn = self._open_connection()
+            if not self.read_only:
+                self._initialize_schema()
         return self._conn
 
     def _initialize_schema(self) -> None:
         schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
         self._conn.execute(schema_sql)
+        if not self.read_only:
+            self._backfill_scan_run_ids()
+
+    def _backfill_scan_run_ids(self) -> None:
+        """Link legacy scan rows to scan_runs when run_id was not stored."""
+        try:
+            self.conn.execute(
+                """
+                UPDATE scan_results AS sr
+                SET scan_run_id = r.run_id
+                FROM scan_runs AS r
+                WHERE sr.scan_run_id IS NULL
+                  AND sr.scan_timestamp = r.scan_timestamp
+                  AND r.segment = 'equity'
+                """
+            )
+            self.conn.execute(
+                """
+                UPDATE fno_scan_results AS fr
+                SET scan_run_id = r.run_id
+                FROM scan_runs AS r
+                WHERE fr.scan_run_id IS NULL
+                  AND fr.scan_timestamp = r.scan_timestamp
+                  AND r.segment = 'fno'
+                """
+            )
+        except duckdb.Error as exc:
+            logger.debug("scan_run_id backfill skipped: %s", exc)
 
     def close(self) -> None:
         if self._conn is not None:
@@ -128,6 +177,7 @@ class DuckDBManager:
             metrics = r.get("metrics", {})
             rows.append(
                 (
+                    r.get("scan_run_id"),
                     r["scan_timestamp"],
                     r["strategy_id"],
                     r["symbol"],
@@ -141,30 +191,350 @@ class DuckDBManager:
         self.conn.executemany(
             """
             INSERT INTO scan_results
-            (scan_timestamp, strategy_id, symbol, signal_date, score, trigger_price, metrics)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (scan_run_id, scan_timestamp, strategy_id, symbol, signal_date,
+             score, trigger_price, metrics)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
         return len(rows)
 
+    def insert_scan_run(
+        self,
+        run_id: str,
+        scan_timestamp: datetime,
+        segment: str,
+        signal_count: int,
+        market_uptrend: bool,
+        strategy_counts: dict[int, int],
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO scan_runs
+            (run_id, scan_timestamp, segment, signal_count, market_uptrend, strategy_counts)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                run_id,
+                scan_timestamp,
+                segment,
+                signal_count,
+                market_uptrend,
+                json.dumps({str(k): v for k, v in strategy_counts.items()}),
+            ],
+        )
+
+    def list_scan_runs(self, segment: str = "equity", limit: int = 50) -> list[dict]:
+        rows: list[tuple] = []
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT run_id, scan_timestamp, signal_count, market_uptrend, strategy_counts
+                FROM scan_runs
+                WHERE segment = ?
+                ORDER BY scan_timestamp DESC
+                LIMIT ?
+                """,
+                [segment, limit],
+            ).fetchall()
+        except duckdb.Error:
+            rows = []
+
+        runs: list[dict] = []
+        seen_timestamps: set[datetime] = set()
+        for r in rows:
+            counts_raw = r[4] or "{}"
+            try:
+                strategy_counts = {int(k): v for k, v in json.loads(counts_raw).items()}
+            except (json.JSONDecodeError, ValueError, TypeError):
+                strategy_counts = {}
+            seen_timestamps.add(r[1])
+            runs.append(
+                {
+                    "run_id": r[0],
+                    "scan_timestamp": r[1],
+                    "signal_count": r[2],
+                    "market_uptrend": bool(r[3]) if r[3] is not None else True,
+                    "strategy_counts": strategy_counts,
+                }
+            )
+
+        table = "scan_results" if segment == "equity" else "fno_scan_results"
+        legacy = self.conn.execute(
+            f"""
+            SELECT scan_timestamp, COUNT(*) AS cnt
+            FROM {table}
+            GROUP BY scan_timestamp
+            ORDER BY scan_timestamp DESC
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+        for ts, cnt in legacy:
+            if ts in seen_timestamps:
+                continue
+            runs.append(
+                {
+                    "run_id": None,
+                    "scan_timestamp": ts,
+                    "signal_count": cnt,
+                    "market_uptrend": True,
+                    "strategy_counts": {},
+                }
+            )
+
+        runs.sort(key=lambda r: r["scan_timestamp"], reverse=True)
+        return runs[:limit]
+
+    def list_scan_timestamps(self, segment: str = "equity", limit: int = 50) -> list[datetime]:
+        return [r["scan_timestamp"] for r in self.list_scan_runs(segment, limit)]
+
+    def get_scan_results(
+        self,
+        scan_run_id: str | None = None,
+        scan_timestamp: datetime | None = None,
+    ) -> pd.DataFrame:
+        if scan_run_id:
+            df = self.conn.execute(
+                """
+                SELECT scan_run_id, scan_timestamp, strategy_id, symbol, signal_date,
+                       score, trigger_price, metrics
+                FROM scan_results WHERE scan_run_id = ?
+                ORDER BY strategy_id, score DESC
+                """,
+                [scan_run_id],
+            ).fetchdf()
+            if not df.empty:
+                return df
+
+            if scan_timestamp is None:
+                row = self.conn.execute(
+                    "SELECT scan_timestamp FROM scan_runs WHERE run_id = ?",
+                    [scan_run_id],
+                ).fetchone()
+                if row:
+                    scan_timestamp = row[0]
+
+            if scan_timestamp is not None:
+                return self.conn.execute(
+                    """
+                    SELECT scan_run_id, scan_timestamp, strategy_id, symbol, signal_date,
+                           score, trigger_price, metrics
+                    FROM scan_results WHERE scan_timestamp = ?
+                    ORDER BY strategy_id, score DESC
+                    """,
+                    [scan_timestamp],
+                ).fetchdf()
+            return df
+
+        if scan_timestamp is not None:
+            return self.conn.execute(
+                """
+                SELECT scan_run_id, scan_timestamp, strategy_id, symbol, signal_date,
+                       score, trigger_price, metrics
+                FROM scan_results WHERE scan_timestamp = ?
+                ORDER BY strategy_id, score DESC
+                """,
+                [scan_timestamp],
+            ).fetchdf()
+
+        return self.get_latest_scan_results()
+
     def get_latest_scan_results(self) -> pd.DataFrame:
+        latest_run = self.conn.execute(
+            """
+            SELECT run_id FROM scan_runs
+            WHERE segment = 'equity'
+            ORDER BY scan_timestamp DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if latest_run:
+            return self.get_scan_results(scan_run_id=latest_run[0])
+
         ts = self.conn.execute(
             "SELECT MAX(scan_timestamp) FROM scan_results"
         ).fetchone()[0]
         if ts is None:
             return pd.DataFrame()
-
-        df = self.conn.execute(
-            """
-            SELECT scan_timestamp, strategy_id, symbol, signal_date,
-                   score, trigger_price, metrics
-            FROM scan_results WHERE scan_timestamp = ?
-            ORDER BY strategy_id, score DESC
-            """,
-            [ts],
-        ).fetchdf()
-        return df
+        return self.get_scan_results(scan_timestamp=ts)
 
     def get_last_refresh_timestamp(self) -> str | None:
         return self.get_metadata("last_refresh_timestamp")
+
+    def upsert_intraday_candles(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        required = {
+            "symbol", "interval", "trade_datetime",
+            "open", "high", "low", "close", "volume",
+        }
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"Missing intraday columns: {missing}")
+
+        clean = df[list(required)].copy()
+        clean["trade_datetime"] = pd.to_datetime(clean["trade_datetime"])
+        self.conn.register("_intraday_tmp", clean)
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO candles_intraday
+            SELECT symbol, interval, trade_datetime, open, high, low, close, volume
+            FROM _intraday_tmp
+            """
+        )
+        self.conn.unregister("_intraday_tmp")
+        return len(clean)
+
+    def load_intraday_candles(
+        self,
+        interval: str = "5minute",
+        symbols: list[str] | None = None,
+    ) -> dict[str, pd.DataFrame]:
+        if symbols:
+            placeholders = ", ".join(["?"] * len(symbols))
+            query = f"""
+                SELECT symbol, interval, trade_datetime, open, high, low, close, volume
+                FROM candles_intraday
+                WHERE interval = ? AND symbol IN ({placeholders})
+                ORDER BY symbol, trade_datetime
+            """
+            params: list = [interval, *symbols]
+        else:
+            query = """
+                SELECT symbol, interval, trade_datetime, open, high, low, close, volume
+                FROM candles_intraday WHERE interval = ?
+                ORDER BY symbol, trade_datetime
+            """
+            params = [interval]
+
+        df = self.conn.execute(query, params).fetchdf()
+        if df.empty:
+            return {}
+        return {
+            sym: grp.reset_index(drop=True)
+            for sym, grp in df.groupby("symbol")
+        }
+
+    def get_intraday_symbols(self, interval: str = "5minute") -> list[str]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT symbol FROM candles_intraday WHERE interval = ? ORDER BY symbol",
+            [interval],
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def insert_fno_scan_results(self, results: list[dict[str, Any]]) -> int:
+        if not results:
+            return 0
+        rows = []
+        for r in results:
+            rows.append(
+                (
+                    r.get("scan_run_id"),
+                    r["scan_timestamp"],
+                    r["strategy_id"],
+                    r["symbol"],
+                    r["signal_datetime"],
+                    r["score"],
+                    r["trigger_price"],
+                    json.dumps(r.get("metrics", {})),
+                )
+            )
+        self.conn.executemany(
+            """
+            INSERT INTO fno_scan_results
+            (scan_run_id, scan_timestamp, strategy_id, symbol, signal_datetime,
+             score, trigger_price, metrics)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        return len(rows)
+
+    def insert_fno_scan_run(
+        self,
+        run_id: str,
+        scan_timestamp: datetime,
+        signal_count: int,
+    ) -> None:
+        self.insert_scan_run(run_id, scan_timestamp, "fno", signal_count, False, {})
+
+    def list_fno_scan_runs(self, limit: int = 50) -> list[dict]:
+        return self.list_scan_runs(segment="fno", limit=limit)
+
+    def list_fno_scan_timestamps(self, limit: int = 50) -> list[datetime]:
+        return self.list_scan_timestamps(segment="fno", limit=limit)
+
+    def get_fno_scan_results(
+        self,
+        scan_run_id: str | None = None,
+        scan_timestamp: datetime | None = None,
+    ) -> pd.DataFrame:
+        if scan_run_id:
+            return self.conn.execute(
+                """
+                SELECT scan_run_id, scan_timestamp, strategy_id, symbol, signal_datetime,
+                       score, trigger_price, metrics
+                FROM fno_scan_results WHERE scan_run_id = ?
+                ORDER BY strategy_id, score DESC
+                """,
+                [scan_run_id],
+            ).fetchdf()
+
+        if scan_timestamp is not None:
+            return self.conn.execute(
+                """
+                SELECT scan_run_id, scan_timestamp, strategy_id, symbol, signal_datetime,
+                       score, trigger_price, metrics
+                FROM fno_scan_results WHERE scan_timestamp = ?
+                ORDER BY strategy_id, score DESC
+                """,
+                [scan_timestamp],
+            ).fetchdf()
+
+        return self.get_latest_fno_scan_results()
+
+    def get_latest_fno_scan_results(self) -> pd.DataFrame:
+        latest_run = self.conn.execute(
+            """
+            SELECT run_id FROM scan_runs
+            WHERE segment = 'fno'
+            ORDER BY scan_timestamp DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if latest_run:
+            return self.get_fno_scan_results(scan_run_id=latest_run[0])
+
+        ts = self.conn.execute(
+            "SELECT MAX(scan_timestamp) FROM fno_scan_results"
+        ).fetchone()[0]
+        if ts is None:
+            return pd.DataFrame()
+        return self.get_fno_scan_results(scan_timestamp=ts)
+
+    def save_backtest_run(
+        self,
+        run_id: str,
+        segment: str,
+        start_date: date,
+        end_date: date,
+        config: dict,
+        summary: list[dict],
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO backtest_runs
+            (run_id, segment, start_date, end_date, config, summary, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                run_id,
+                segment,
+                start_date,
+                end_date,
+                json.dumps(config),
+                json.dumps(summary),
+                datetime.now(),
+            ],
+        )

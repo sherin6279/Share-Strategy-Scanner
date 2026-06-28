@@ -22,6 +22,9 @@ def get_market_regime(
         return False, None
 
     bench_idx = _aligned_benchmark_idx(stock_candles, nifty_candles, evaluation_index)
+    if bench_idx is None:
+        return False, None
+
     row = nifty_candles.iloc[bench_idx]
     nifty_sma200 = row.get("sma200")
     if pd.isna(nifty_sma200):

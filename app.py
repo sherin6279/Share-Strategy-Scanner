@@ -19,6 +19,7 @@ from database.duckdb_manager import DuckDBManager
 from exports.export_service import export_csv, export_excel, prepare_display_df
 from scanners.scanner import Scanner
 from strategies.strategy_engine import STRATEGIES
+from ui.pages_extra import render_backtest_page, render_fno_page
 
 # Page config
 st.set_page_config(
@@ -39,6 +40,12 @@ STRATEGY_TABS = {
 }
 
 
+@st.cache_resource
+def get_db() -> DuckDBManager:
+    """Single write connection for the Streamlit process."""
+    return DuckDBManager()
+
+
 def init_session_state() -> None:
     defaults = {
         "access_token": KITE_ACCESS_TOKEN,
@@ -46,10 +53,39 @@ def init_session_state() -> None:
         "scan_summary": None,
         "strategy_3_paused": False,
         "market_uptrend": True,
+        "selected_equity_scan_ts": None,
+        "selected_fno_scan_ts": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
+
+    # Hydrate scan state from DB so tabs show results after page refresh
+    if st.session_state.get("scan_summary") is None:
+        try:
+            db = get_db()
+        except RuntimeError as exc:
+            st.warning(str(exc))
+            return
+        last_scan = db.get_metadata("last_scan_timestamp")
+        if last_scan:
+            uptrend_raw = db.get_metadata("last_scan_market_uptrend", "true")
+            st.session_state.market_uptrend = uptrend_raw == "true"
+            st.session_state.strategy_3_paused = not st.session_state.market_uptrend
+            counts_raw = db.get_metadata("last_scan_strategy_counts", "{}")
+            try:
+                strategy_counts = {
+                    int(k): v for k, v in json.loads(counts_raw).items()
+                }
+            except (json.JSONDecodeError, ValueError):
+                strategy_counts = {}
+            st.session_state.scan_summary = {
+                "scan_timestamp": last_scan,
+                "signal_count": sum(strategy_counts.values()) if strategy_counts else 0,
+                "strategy_counts": strategy_counts,
+                "market_uptrend": st.session_state.market_uptrend,
+                "strategy_3_paused": st.session_state.strategy_3_paused,
+            }
 
 
 def get_fetcher() -> KiteFetcher:
@@ -106,6 +142,51 @@ def render_kite_login() -> None:
                 st.rerun()
             except Exception as exc:
                 st.sidebar.error(f"Login failed: {exc}")
+
+
+def _format_scan_timestamp(ts) -> str:
+    if ts is None:
+        return ""
+    if isinstance(ts, str):
+        return ts.replace("T", " ")[:19]
+    return ts.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_run_label(run: dict) -> str:
+    ts = _format_scan_timestamp(run["scan_timestamp"])
+    counts = run.get("strategy_counts") or {}
+    if counts:
+        breakdown = ", ".join(f"S{k}:{v}" for k, v in sorted(counts.items()) if v > 0)
+        return f"{ts} ({run['signal_count']} signals — {breakdown})"
+    return f"{ts} ({run['signal_count']} signals)"
+
+
+def render_equity_scan_selector(db: DuckDBManager) -> dict | None:
+    """Return the selected equity scan run metadata."""
+    runs = db.list_scan_runs("equity")
+    if not runs:
+        return None
+
+    labels = [_format_run_label(r) for r in runs]
+    selected_run_id = st.session_state.get("selected_equity_scan_run_id")
+    default_idx = 0
+    if selected_run_id:
+        for i, r in enumerate(runs):
+            if r["run_id"] == selected_run_id:
+                default_idx = i
+                break
+    elif st.session_state.get("selected_equity_scan_ts") is not None:
+        legacy_ts = st.session_state.selected_equity_scan_ts
+        for i, r in enumerate(runs):
+            if str(r["scan_timestamp"]) == str(legacy_ts):
+                default_idx = i
+                break
+
+    choice = st.selectbox("View scan from", labels, index=default_idx, key="equity_scan_picker")
+    chosen = runs[labels.index(choice)]
+    st.session_state.selected_equity_scan_run_id = chosen["run_id"]
+    st.session_state.selected_equity_scan_ts = chosen["scan_timestamp"]
+    return chosen
 
 
 def render_header(db: DuckDBManager) -> None:
@@ -191,9 +272,19 @@ def _run_scan(db: DuckDBManager) -> None:
             st.session_state.scan_summary = summary
             st.session_state.strategy_3_paused = summary.get("strategy_3_paused", False)
             st.session_state.market_uptrend = summary.get("market_uptrend", True)
+            st.session_state.selected_equity_scan_run_id = summary.get("scan_run_id")
+            st.session_state.selected_equity_scan_ts = datetime.fromisoformat(
+                summary["scan_timestamp"]
+            )
 
+            counts = summary.get("strategy_counts", {})
+            breakdown = ", ".join(
+                f"S{k}: {v}" for k, v in sorted(counts.items()) if v > 0
+            )
             st.success(
                 f"Scan complete: {summary['signal_count']} signals in {elapsed:.1f}s"
+                + (f" ({breakdown})" if breakdown else "")
+                + f" — saved at {summary['scan_timestamp']}"
             )
             if summary.get("strategy_3_paused"):
                 st.warning("Market in downtrend — Strategy 3 paused")
@@ -202,29 +293,58 @@ def _run_scan(db: DuckDBManager) -> None:
                     "NIFTY 50 is below its 200-day SMA — Strategies 4–7 still run "
                     "but signals are tagged with a caution note"
                 )
+            st.rerun()
         except Exception as exc:
             st.error(f"Scan failed: {exc}")
 
 
-def render_strategy_tab(scanner: Scanner, strategy_id: int, tab_name: str) -> None:
-    if strategy_id == 3 and st.session_state.get("strategy_3_paused"):
+def render_strategy_tab(
+    scanner: Scanner,
+    strategy_id: int,
+    tab_name: str,
+    scan_run_id: str | None = None,
+    scan_timestamp: datetime | None = None,
+    market_uptrend: bool = True,
+) -> None:
+    if strategy_id == 3 and not market_uptrend:
         st.warning("Market in downtrend — Strategy 3 paused")
 
-    if strategy_id in (4, 5, 6, 7) and not st.session_state.get("market_uptrend", True):
+    if strategy_id in (4, 5, 6, 7) and not market_uptrend:
         st.warning(
             "NIFTY 50 is below its 200-day SMA — review these picks with extra caution"
         )
 
-    df = scanner.get_results_by_strategy(strategy_id)
+    df = scanner.get_results_by_strategy(
+        strategy_id, scan_run_id=scan_run_id, scan_timestamp=scan_timestamp
+    )
     if df.empty:
-        st.info("No results. Run a scan after refreshing market data.")
+        all_results = scanner.db.get_scan_results(
+            scan_run_id=scan_run_id, scan_timestamp=scan_timestamp
+        )
+        if all_results.empty:
+            st.info("No results yet. Click **Run Scan** after refreshing market data.")
+        else:
+            counts = all_results.groupby("strategy_id").size().to_dict()
+            active = ", ".join(
+                f"S{k}:{v}" for k, v in sorted(counts.items()) if v > 0
+            )
+            st.info(
+                f"No matches for **{tab_name}** in this scan."
+                + (f" Other strategies did find signals ({active})." if active else "")
+            )
         return
 
-    _render_results_table(df, tab_name)
+    _render_results_table(df, tab_name, scan_timestamp=scan_timestamp)
 
 
-def render_confluence_tab(scanner: Scanner) -> None:
-    df = scanner.get_confluence(min_strategies=2)
+def render_confluence_tab(
+    scanner: Scanner,
+    scan_run_id: str | None = None,
+    scan_timestamp: datetime | None = None,
+) -> None:
+    df = scanner.get_confluence(
+        min_strategies=2, scan_run_id=scan_run_id, scan_timestamp=scan_timestamp
+    )
     if df.empty:
         st.info("No confluence signals (stocks in 2+ strategies).")
         return
@@ -239,18 +359,25 @@ def render_confluence_tab(scanner: Scanner) -> None:
             "average_score": "Average Score",
         }
     )
-    _render_dataframe_with_controls(display, "confluence")
+    _render_dataframe_with_controls(display, "confluence", scan_timestamp=scan_timestamp)
 
 
-def _render_results_table(df: pd.DataFrame, export_name: str) -> None:
+def _render_results_table(
+    df: pd.DataFrame,
+    export_name: str,
+    scan_timestamp: datetime | None = None,
+) -> None:
     display = prepare_display_df(df)
-    _render_dataframe_with_controls(display, export_name, export_source=df)
+    _render_dataframe_with_controls(
+        display, export_name, export_source=df, scan_timestamp=scan_timestamp
+    )
 
 
 def _render_dataframe_with_controls(
     df: pd.DataFrame,
     export_name: str,
     export_source: pd.DataFrame | None = None,
+    scan_timestamp: datetime | None = None,
 ) -> None:
     search = st.text_input("Search", key=f"search_{export_name}", placeholder="Filter symbols...")
     filtered = df.copy()
@@ -273,12 +400,18 @@ def _render_dataframe_with_controls(
     )
 
     export_df = export_source if export_source is not None else df
+    ts_suffix = ""
+    if scan_timestamp is not None:
+        ts_suffix = f"_{scan_timestamp:%Y%m%d_%H%M%S}"
+    elif "Scan Time" in df.columns and not df.empty:
+        ts_suffix = f"_{pd.Timestamp(df['Scan Time'].iloc[0]):%Y%m%d_%H%M%S}"
+
     col1, col2 = st.columns(2)
     with col1:
         st.download_button(
             "Export CSV",
             data=export_csv(export_df),
-            file_name=f"{export_name.lower().replace(' ', '_')}_{datetime.now():%Y%m%d}.csv",
+            file_name=f"{export_name.lower().replace(' ', '_')}{ts_suffix}.csv",
             mime="text/csv",
             key=f"csv_{export_name}",
         )
@@ -286,7 +419,7 @@ def _render_dataframe_with_controls(
         st.download_button(
             "Export Excel",
             data=export_excel(export_df),
-            file_name=f"{export_name.lower().replace(' ', '_')}_{datetime.now():%Y%m%d}.xlsx",
+            file_name=f"{export_name.lower().replace(' ', '_')}{ts_suffix}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"xlsx_{export_name}",
         )
@@ -296,27 +429,67 @@ def main() -> None:
     init_session_state()
     render_kite_login()
 
-    db = DuckDBManager()
-    render_header(db)
+    try:
+        db = get_db()
+        db._initialize_schema()
+    except RuntimeError as exc:
+        st.error(str(exc))
+        st.stop()
 
-    scanner = Scanner(db=db)
-
-    tabs = st.tabs(
-        [STRATEGY_TABS[i] for i in range(1, 8)] + ["Confluence"]
+    mode = st.sidebar.radio(
+        "Segment",
+        ["Equity", "F&O Intraday", "Backtest"],
+        index=0,
     )
 
-    for i, tab in enumerate(tabs[:7], start=1):
-        with tab:
-            render_strategy_tab(scanner, i, STRATEGY_TABS[i])
-
-    with tabs[7]:
-        render_confluence_tab(scanner)
+    if mode == "Equity":
+        render_header(db)
+        scanner = Scanner(db=db)
+        selected_run = render_equity_scan_selector(db)
+        scan_run_id = None
+        scan_ts = None
+        market_uptrend = st.session_state.get("market_uptrend", True)
+        if selected_run:
+            scan_run_id = selected_run["run_id"]
+            scan_ts = selected_run["scan_timestamp"]
+            market_uptrend = selected_run.get("market_uptrend", market_uptrend)
+            st.caption(
+                f"Showing results from scan at **{_format_scan_timestamp(scan_ts)}**"
+            )
+            if not market_uptrend:
+                st.caption(
+                    "NIFTY 50 is below its 200-day SMA — Strategy 3 is paused; "
+                    "Strategies 4–7 may show fewer picks than in an uptrend."
+                )
+        tabs = st.tabs(
+            [STRATEGY_TABS[i] for i in range(1, 8)] + ["Confluence"]
+        )
+        for i, tab in enumerate(tabs[:7], start=1):
+            with tab:
+                render_strategy_tab(
+                    scanner,
+                    i,
+                    STRATEGY_TABS[i],
+                    scan_run_id=scan_run_id,
+                    scan_timestamp=scan_ts,
+                    market_uptrend=market_uptrend,
+                )
+        with tabs[7]:
+            render_confluence_tab(
+                scanner, scan_run_id=scan_run_id, scan_timestamp=scan_ts
+            )
+    elif mode == "F&O Intraday":
+        render_fno_page(db, get_fetcher)
+    else:
+        render_backtest_page(db)
 
     # Footer stats
     with st.sidebar.expander("Database Stats"):
         symbols = db.get_all_symbols()
-        st.write(f"Symbols in DB: {len(symbols)}")
+        st.write(f"Equity symbols: {len(symbols)}")
         st.write(f"NIFTY 50 loaded: {NIFTY50_SYMBOL in symbols}")
+        fno_syms = db.get_intraday_symbols()
+        st.write(f"F&O intraday symbols: {len(fno_syms)}")
         if st.session_state.refresh_summary:
             st.json(st.session_state.refresh_summary)
 

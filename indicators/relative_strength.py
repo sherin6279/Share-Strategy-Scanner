@@ -16,13 +16,20 @@ def period_return(df: pd.DataFrame, idx: int, days: int) -> float:
     return safe_pct(end_close, start_close)
 
 
-def _aligned_benchmark_idx(stock_df: pd.DataFrame, benchmark_df: pd.DataFrame, idx: int) -> int:
+def _aligned_benchmark_idx(stock_df: pd.DataFrame, benchmark_df: pd.DataFrame, idx: int) -> int | None:
     """Map stock evaluation index to benchmark index by trade_date."""
+    if idx < 0 or idx >= len(stock_df) or benchmark_df.empty:
+        return None
+
     trade_date = stock_df.iloc[idx]["trade_date"]
     matches = benchmark_df.index[benchmark_df["trade_date"] == trade_date].tolist()
     if matches:
-        return matches[0]
-    return min(idx, len(benchmark_df) - 1)
+        return int(matches[0])
+
+    prior = benchmark_df[benchmark_df["trade_date"] <= trade_date]
+    if prior.empty:
+        return None
+    return int(prior.index[-1])
 
 
 def relative_strength_vs_benchmark(
@@ -33,6 +40,8 @@ def relative_strength_vs_benchmark(
 ) -> float:
     """Stock return minus benchmark return over period (percentage points)."""
     bench_idx = _aligned_benchmark_idx(stock_df, benchmark_df, idx)
+    if bench_idx is None:
+        return float("nan")
     stock_ret = period_return(stock_df, idx, days)
     bench_ret = period_return(benchmark_df, bench_idx, days)
     return stock_ret - bench_ret

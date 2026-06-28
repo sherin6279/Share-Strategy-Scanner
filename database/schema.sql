@@ -24,7 +24,59 @@ CREATE TABLE IF NOT EXISTS scan_metadata (
     value VARCHAR
 );
 
+CREATE TABLE IF NOT EXISTS scan_runs (
+    run_id VARCHAR PRIMARY KEY,
+    scan_timestamp TIMESTAMP,
+    segment VARCHAR,
+    signal_count INTEGER,
+    market_uptrend BOOLEAN,
+    strategy_counts JSON
+);
+
+-- F&O intraday candles (5minute default)
+CREATE TABLE IF NOT EXISTS candles_intraday (
+    symbol VARCHAR,
+    interval VARCHAR,
+    trade_datetime TIMESTAMP,
+    open DOUBLE,
+    high DOUBLE,
+    low DOUBLE,
+    close DOUBLE,
+    volume BIGINT,
+    PRIMARY KEY(symbol, interval, trade_datetime)
+);
+
+CREATE TABLE IF NOT EXISTS fno_scan_results (
+    scan_timestamp TIMESTAMP,
+    strategy_id INTEGER,
+    symbol VARCHAR,
+    signal_datetime TIMESTAMP,
+    score DOUBLE,
+    trigger_price DOUBLE,
+    metrics JSON
+);
+
+-- scan_run_id links each result row to a specific scan execution
+ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS scan_run_id VARCHAR;
+ALTER TABLE fno_scan_results ADD COLUMN IF NOT EXISTS scan_run_id VARCHAR;
+
+CREATE INDEX IF NOT EXISTS idx_scan_results_run ON scan_results(scan_run_id);
+CREATE INDEX IF NOT EXISTS idx_fno_scan_results_run ON fno_scan_results(scan_run_id);
+
 CREATE INDEX IF NOT EXISTS idx_candles_symbol ON candles(symbol);
 CREATE INDEX IF NOT EXISTS idx_candles_date ON candles(trade_date);
 CREATE INDEX IF NOT EXISTS idx_scan_results_ts ON scan_results(scan_timestamp);
 CREATE INDEX IF NOT EXISTS idx_scan_results_strategy ON scan_results(strategy_id);
+
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    run_id VARCHAR PRIMARY KEY,
+    segment VARCHAR,
+    start_date DATE,
+    end_date DATE,
+    config JSON,
+    summary JSON,
+    created_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_intraday_symbol ON candles_intraday(symbol);
+CREATE INDEX IF NOT EXISTS idx_intraday_dt ON candles_intraday(trade_datetime);
