@@ -45,6 +45,9 @@ BACKTEST_COST_BPS_FNO: float = 5.0
 # F&O intraday
 FNO_INTERVAL: str = "5minute"
 FNO_INTRADAY_DAYS: int = 30
+FNO_INDEX_UNDERLYINGS: list[str] = ["NIFTY", "BANKNIFTY"]
+FNO_STOCK_COUNT: int = 50
+FNO_STOCK_VOLUME_LOOKBACK: int = 20
 
 # Ensure directories exist
 DATA_DIR.mkdir(parents=True, exist_ok=True)

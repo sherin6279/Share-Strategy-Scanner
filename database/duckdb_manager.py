@@ -59,6 +59,43 @@ class DuckDBManager:
         self._conn.execute(schema_sql)
         if not self.read_only:
             self._backfill_scan_run_ids()
+            self._migrate_portfolio_schema()
+
+    def _migrate_portfolio_schema(self) -> None:
+        """Apply portfolio dedupe + scan log for existing databases."""
+        try:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS portfolio_scan_log (
+                    scan_run_id VARCHAR PRIMARY KEY,
+                    processed_at TIMESTAMP NOT NULL,
+                    holdings_added INTEGER DEFAULT 0
+                )
+                """
+            )
+            self.dedupe_portfolio_holdings()
+            self.conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_portfolio_symbol_date
+                ON portfolio_holdings(symbol, purchase_date)
+                """
+            )
+            self._backfill_portfolio_scan_log()
+        except duckdb.Error as exc:
+            logger.debug("portfolio migration skipped: %s", exc)
+
+    def _backfill_portfolio_scan_log(self) -> None:
+        """Mark scans that already have holdings as processed."""
+        self.conn.execute(
+            """
+            INSERT INTO portfolio_scan_log (scan_run_id, processed_at, holdings_added)
+            SELECT scan_run_id, MAX(created_at), COUNT(*)
+            FROM portfolio_holdings
+            WHERE scan_run_id IS NOT NULL
+              AND scan_run_id NOT IN (SELECT scan_run_id FROM portfolio_scan_log)
+            GROUP BY scan_run_id
+            """
+        )
 
     def _backfill_scan_run_ids(self) -> None:
         """Link legacy scan rows to scan_runs when run_id was not stored."""
@@ -515,6 +552,91 @@ class DuckDBManager:
             return pd.DataFrame()
         return self.get_fno_scan_results(scan_timestamp=ts)
 
+    def get_avg_equity_volumes(
+        self,
+        symbols: list[str],
+        lookback_days: int = 20,
+    ) -> dict[str, float]:
+        """Average daily volume over the last N trading days per symbol."""
+        if not symbols:
+            return {}
+        placeholders = ", ".join(["?"] * len(symbols))
+        df = self.conn.execute(
+            f"""
+            WITH ranked AS (
+                SELECT symbol, volume,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY symbol ORDER BY trade_date DESC
+                       ) AS rn
+                FROM candles
+                WHERE symbol IN ({placeholders})
+            )
+            SELECT symbol, AVG(volume) AS avg_vol
+            FROM ranked
+            WHERE rn <= ?
+            GROUP BY symbol
+            """,
+            [*symbols, lookback_days],
+        ).fetchdf()
+        return {row["symbol"]: float(row["avg_vol"]) for _, row in df.iterrows()}
+
+    def dedupe_portfolio_holdings(self) -> int:
+        """Keep earliest holding per (symbol, purchase_date); remove duplicates."""
+        before = self.count_portfolio_holdings()
+        try:
+            self.conn.execute(
+                """
+                DELETE FROM portfolio_holdings
+                WHERE holding_id IN (
+                    SELECT holding_id FROM (
+                        SELECT holding_id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY symbol, purchase_date
+                                   ORDER BY created_at, holding_id
+                               ) AS rn
+                        FROM portfolio_holdings
+                    ) AS ranked
+                    WHERE rn > 1
+                )
+                """
+            )
+        except duckdb.Error as exc:
+            logger.debug("portfolio dedupe skipped: %s", exc)
+            return 0
+        return before - self.count_portfolio_holdings()
+
+    def log_portfolio_scan(
+        self,
+        scan_run_id: str,
+        processed_at: datetime,
+        holdings_added: int,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO portfolio_scan_log
+            (scan_run_id, processed_at, holdings_added)
+            VALUES (?, ?, ?)
+            """,
+            [scan_run_id, processed_at, holdings_added],
+        )
+
+    def portfolio_scan_processed(self, scan_run_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM portfolio_scan_log WHERE scan_run_id = ? LIMIT 1",
+            [scan_run_id],
+        ).fetchone()
+        return row is not None
+
+    def get_portfolio_symbol_dates(self) -> set[tuple[str, date]]:
+        rows = self.conn.execute(
+            "SELECT symbol, purchase_date FROM portfolio_holdings"
+        ).fetchall()
+        result: set[tuple[str, date]] = set()
+        for sym, pd_val in rows:
+            d = pd_val.date() if hasattr(pd_val, "date") else pd_val
+            result.add((sym, d))
+        return result
+
     def insert_portfolio_holdings(self, holdings: list[dict[str, Any]]) -> int:
         if not holdings:
             return 0
@@ -546,11 +668,11 @@ class DuckDBManager:
         return len(rows)
 
     def portfolio_exists_for_scan(self, scan_run_id: str) -> bool:
-        row = self.conn.execute(
-            "SELECT 1 FROM portfolio_holdings WHERE scan_run_id = ? LIMIT 1",
-            [scan_run_id],
-        ).fetchone()
-        return row is not None
+        return self.portfolio_scan_processed(scan_run_id)
+
+    def list_equity_scan_runs_chronological(self, limit: int = 500) -> list[dict]:
+        runs = self.list_scan_runs(segment="equity", limit=limit)
+        return sorted(runs, key=lambda r: r["scan_timestamp"])
 
     def list_portfolio_holdings(self) -> pd.DataFrame:
         return self.conn.execute(

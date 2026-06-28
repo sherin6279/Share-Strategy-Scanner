@@ -34,19 +34,53 @@ class PaperTradingService:
     def __init__(self, db: DuckDBManager | None = None) -> None:
         self.db = db or DuckDBManager()
 
+    def sync_portfolio_from_scans(self) -> dict[str, Any]:
+        """
+        Import all historical equity scans into the portfolio.
+
+        Skips scans already processed and symbols already held on the same date.
+        """
+        removed = self.db.dedupe_portfolio_holdings()
+        runs = self.db.list_equity_scan_runs_chronological()
+        scans_processed = 0
+        total_added = 0
+        skipped_scans = 0
+
+        for run in runs:
+            run_id = run.get("run_id")
+            if not run_id:
+                continue
+            if self.db.portfolio_scan_processed(run_id):
+                skipped_scans += 1
+                continue
+            result = self.record_from_scan(run_id)
+            scans_processed += 1
+            total_added += result.get("holdings_added", 0)
+
+        return {
+            "scans_processed": scans_processed,
+            "scans_skipped": skipped_scans,
+            "holdings_added": total_added,
+            "duplicates_removed": removed,
+            "total_holdings": self.db.count_portfolio_holdings(),
+        }
+
     def record_from_scan(self, scan_run_id: str) -> dict[str, Any]:
         """
         Buy 1 share of each unique scan pick at the signal-day close.
 
-        Multiple strategies for the same symbol in one scan → one Confluence row.
+        - Multiple strategies for the same symbol in one scan → Confluence row.
+        - Same symbol on the same purchase date is never added twice.
+        - Re-running the same scan is a no-op (tracked in portfolio_scan_log).
         """
-        if self.db.portfolio_exists_for_scan(scan_run_id):
+        if self.db.portfolio_scan_processed(scan_run_id):
             holdings = self.db.list_portfolio_holdings()
             n = len(holdings[holdings["scan_run_id"] == scan_run_id])
-            logger.info("Portfolio already recorded for scan %s", scan_run_id)
+            logger.info("Scan %s already in portfolio log", scan_run_id)
             return {
                 "scan_run_id": scan_run_id,
                 "holdings_added": 0,
+                "holdings_skipped_duplicate": 0,
                 "holdings_count": n,
                 "already_recorded": True,
             }
@@ -56,30 +90,42 @@ class PaperTradingService:
             raise RuntimeError(f"No scan results found for run {scan_run_id}")
 
         created_at = datetime.now()
-        holdings = self._build_holdings_from_scan(scan_df, scan_run_id, created_at)
-        if not holdings:
-            return {
-                "scan_run_id": scan_run_id,
-                "holdings_added": 0,
-                "holdings_count": 0,
-                "already_recorded": False,
-            }
+        candidates = self._build_holdings_from_scan(scan_df, scan_run_id, created_at)
+        holdings, skipped = self._filter_duplicate_symbol_dates(candidates)
 
-        self.db.insert_portfolio_holdings(holdings)
-        logger.info(
-            "Added %d holdings to portfolio from scan %s",
-            len(holdings),
-            scan_run_id,
-        )
+        added = 0
+        if holdings:
+            added = self.db.insert_portfolio_holdings(holdings)
+            logger.info("Added %d holdings from scan %s (%d dupes skipped)", added, scan_run_id, skipped)
+
+        self.db.log_portfolio_scan(scan_run_id, created_at, added)
+
         return {
             "scan_run_id": scan_run_id,
-            "holdings_added": len(holdings),
-            "holdings_count": len(holdings),
+            "holdings_added": added,
+            "holdings_skipped_duplicate": skipped,
+            "holdings_count": added,
             "confluence_count": sum(
                 1 for h in holdings if h["source_type"] == CONFLUENCE_TYPE
             ),
             "already_recorded": False,
         }
+
+    def _filter_duplicate_symbol_dates(
+        self,
+        holdings: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int]:
+        existing = self.db.get_portfolio_symbol_dates()
+        kept: list[dict[str, Any]] = []
+        skipped = 0
+        for h in holdings:
+            key = (h["symbol"], h["purchase_date"])
+            if key in existing:
+                skipped += 1
+                continue
+            kept.append(h)
+            existing.add(key)
+        return kept, skipped
 
     def _build_holdings_from_scan(
         self,
@@ -125,6 +171,11 @@ class PaperTradingService:
                 }
             )
         return holdings
+
+    def get_strategy_group(self, source_type: str, source_label: str) -> str:
+        if source_type == CONFLUENCE_TYPE:
+            return "Confluence"
+        return source_label
 
     def get_portfolio(self) -> pd.DataFrame:
         """All holdings marked to market with P/L as of latest stored prices."""
@@ -175,6 +226,9 @@ class PaperTradingService:
                     "holding_id": h["holding_id"],
                     "symbol": symbol,
                     "source": source_label,
+                    "strategy_group": self.get_strategy_group(
+                        h["source_type"], h["source_label"]
+                    ),
                     "source_type": h["source_type"],
                     "purchase_date": purchase_date,
                     "purchase_price": purchase_price,
@@ -229,3 +283,53 @@ class PaperTradingService:
             "latest_price_date": priced["current_date"].max() if len(priced) else None,
             "symbols": df["symbol"].nunique(),
         }
+
+    def summarize_by_date(self, df: pd.DataFrame | None = None) -> pd.DataFrame:
+        df = df if df is not None else self.get_portfolio()
+        if df.empty:
+            return pd.DataFrame()
+
+        rows = []
+        for purchase_date, grp in df.groupby("purchase_date", sort=False):
+            priced = grp[grp["pl_amount"].notna()]
+            cost = float(grp["cost_basis"].sum())
+            pl = float(priced["pl_amount"].sum()) if len(priced) else 0.0
+            rows.append(
+                {
+                    "purchase_date": purchase_date,
+                    "holdings": len(grp),
+                    "invested": cost,
+                    "market_value": float(priced["market_value"].sum()) if len(priced) else 0.0,
+                    "pl_amount": pl,
+                    "pl_pct": (pl / cost * 100.0) if cost else None,
+                    "winners": int((priced["pl_amount"] > 0).sum()) if len(priced) else 0,
+                }
+            )
+        out = pd.DataFrame(rows)
+        return out.sort_values("purchase_date", ascending=False).reset_index(drop=True)
+
+    def summarize_by_strategy(self, df: pd.DataFrame | None = None) -> pd.DataFrame:
+        df = df if df is not None else self.get_portfolio()
+        if df.empty:
+            return pd.DataFrame()
+
+        rows = []
+        for strategy, grp in df.groupby("strategy_group", sort=False):
+            priced = grp[grp["pl_amount"].notna()]
+            cost = float(grp["cost_basis"].sum())
+            pl = float(priced["pl_amount"].sum()) if len(priced) else 0.0
+            rows.append(
+                {
+                    "strategy": strategy,
+                    "holdings": len(grp),
+                    "invested": cost,
+                    "market_value": float(priced["market_value"].sum()) if len(priced) else 0.0,
+                    "pl_amount": pl,
+                    "pl_pct": (pl / cost * 100.0) if cost else None,
+                    "win_rate": (
+                        float((priced["pl_amount"] > 0).mean() * 100.0) if len(priced) else None
+                    ),
+                }
+            )
+        out = pd.DataFrame(rows)
+        return out.sort_values("pl_amount", ascending=False).reset_index(drop=True)

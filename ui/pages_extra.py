@@ -30,8 +30,13 @@ def _fmt_ts(ts) -> str:
 
 
 def render_fno_page(db: DuckDBManager, get_fetcher) -> None:
+    from config.settings import FNO_INDEX_UNDERLYINGS, FNO_STOCK_COUNT
+
     st.subheader("F&O Intraday Screener")
-    st.caption("Index/stock futures on 5-minute candles — NIFTY & BANKNIFTY by default")
+    st.caption(
+        f"5-minute candles — {', '.join(FNO_INDEX_UNDERLYINGS)} index futures plus "
+        f"top {FNO_STOCK_COUNT} liquid NIFTY 500 stock futures (by equity volume)."
+    )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -42,7 +47,16 @@ def render_fno_page(db: DuckDBManager, get_fetcher) -> None:
             _run_fno_scan(db)
 
     symbols = db.get_intraday_symbols()
-    st.caption(f"Intraday symbols loaded: {len(symbols)} — {', '.join(symbols[:5])}")
+    index_n = db.get_metadata("last_fno_refresh_index_count", "—")
+    stock_n = db.get_metadata("last_fno_refresh_stock_count", "—")
+    st.caption(
+        f"Intraday symbols loaded: **{len(symbols)}** "
+        f"(last refresh: {index_n} index, {stock_n} stock)"
+    )
+    if symbols:
+        preview = ", ".join(symbols[:8])
+        suffix = f" … +{len(symbols) - 8} more" if len(symbols) > 8 else ""
+        st.caption(f"{preview}{suffix}")
 
     runs = db.list_fno_scan_runs()
     scan_run_id = None
@@ -99,13 +113,28 @@ def _run_fno_refresh(db: DuckDBManager, get_fetcher) -> None:
             access_token=fetcher.access_token,
             api_secret=fetcher.api_secret,
         )
+    progress = st.progress(0, text="Resolving F&O universe...")
+    status = st.empty()
     try:
+
+        def callback(current: int, total: int, label: str) -> None:
+            pct = current / total if total else 1.0
+            progress.progress(pct, text=f"Fetching {current} / {total}")
+            status.caption(label)
+
         with st.spinner("Fetching F&O intraday data..."):
-            summary = FnoRefreshService(db=db, fetcher=fetcher).refresh()
+            summary = FnoRefreshService(db=db, fetcher=fetcher).refresh(
+                progress_callback=callback
+            )
+        progress.progress(1.0, text="F&O refresh complete")
         st.success(
-            f"Fetched {summary['symbols_fetched']} symbols, "
-            f"{summary['rows_upserted']} bars"
+            f"Fetched {summary['symbols_fetched']} symbols "
+            f"({summary['index_fetched']} index, {summary['stock_fetched']} stock), "
+            f"{summary['rows_upserted']:,} bars"
         )
+        if summary["failed_symbols"]:
+            with st.expander(f"Failed ({summary['symbols_failed']})"):
+                st.write(summary["failed_symbols"])
     except Exception as exc:
         st.error(str(exc))
 

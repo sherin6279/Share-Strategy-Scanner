@@ -299,15 +299,23 @@ def _run_scan(db: DuckDBManager) -> None:
             try:
                 paper = PaperTradingService(db=db).record_from_scan(summary["scan_run_id"])
                 if paper.get("already_recorded"):
+                    st.caption("Portfolio: this scan was already saved")
+                elif paper.get("holdings_added", 0) == 0:
+                    skipped = paper.get("holdings_skipped_duplicate", 0)
                     st.caption(
-                        f"Portfolio: {paper['holdings_count']} holdings already saved for this scan"
+                        f"Portfolio: no new picks "
+                        f"({skipped} already held today)" if skipped else "Portfolio: no new picks"
                     )
                 else:
                     conf = paper.get("confluence_count", 0)
-                    st.caption(
-                        f"Portfolio: bought 1 share each of {paper['holdings_added']} picks "
+                    skipped = paper.get("holdings_skipped_duplicate", 0)
+                    msg = (
+                        f"Portfolio: added {paper['holdings_added']} new picks "
                         f"({conf} confluence)"
                     )
+                    if skipped:
+                        msg += f", {skipped} skipped (already held today)"
+                    st.caption(msg)
             except Exception as paper_exc:
                 st.warning(f"Portfolio not updated: {paper_exc}")
 

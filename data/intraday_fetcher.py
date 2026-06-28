@@ -3,43 +3,66 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Any
 
 import pandas as pd
 
-from config.settings import REQUEST_DELAY_SEC
+from config.settings import FNO_INDEX_UNDERLYINGS, REQUEST_DELAY_SEC
 from data.kite_fetcher import KiteFetcher
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Default liquid F&O universe (nearest month future tradingsymbols resolved at fetch time)
-DEFAULT_FNO_UNDERLYINGS = ["NIFTY", "BANKNIFTY"]
-
 
 class IntradayFetcher(KiteFetcher):
     """Extends KiteFetcher for NFO intraday candles."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._nfo_instruments: list[dict[str, Any]] = []
+
     def load_nfo_instruments(self) -> None:
         self._rate_limit()
         instruments = self.kite.instruments("NFO")
-        self._instrument_map = {}
-        for inst in instruments:
-            ts = inst["tradingsymbol"]
-            self._instrument_map[ts] = inst["instrument_token"]
+        self._nfo_instruments = instruments
+        self._instrument_map = {
+            inst["tradingsymbol"]: inst["instrument_token"] for inst in instruments
+        }
         logger.info("Loaded %d NFO instruments", len(self._instrument_map))
 
-    def nearest_future_symbol(self, underlying: str) -> str | None:
-        """Find nearest expiry FUT tradingsymbol for an underlying."""
-        if not self._instrument_map:
+    def _live_futures(self) -> list[dict[str, Any]]:
+        if not self._nfo_instruments:
             self.load_nfo_instruments()
+        today = datetime.now().date()
+        live: list[dict[str, Any]] = []
+        for inst in self._nfo_instruments:
+            if inst.get("instrument_type") != "FUT":
+                continue
+            expiry = inst.get("expiry")
+            if expiry is None:
+                continue
+            exp_date = pd.Timestamp(expiry).date()
+            if exp_date < today:
+                continue
+            live.append(inst)
+        return live
 
-        candidates = [
-            ts for ts in self._instrument_map
-            if ts.startswith(underlying) and ts.endswith("FUT")
-        ]
+    def list_live_fut_underlyings(self) -> set[str]:
+        """Underlying names with at least one non-expired FUT contract."""
+        return {inst["name"] for inst in self._live_futures()}
+
+    def nearest_future_symbol(self, underlying: str) -> str | None:
+        """Find nearest-expiry FUT tradingsymbol for an underlying."""
+        candidates: list[tuple[Any, str]] = []
+        for inst in self._live_futures():
+            if inst.get("name") != underlying:
+                continue
+            expiry = pd.Timestamp(inst["expiry"]).date()
+            candidates.append((expiry, inst["tradingsymbol"]))
         if not candidates:
             return None
-        return sorted(candidates)[0]
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
 
     def fetch_intraday(
         self,
@@ -75,7 +98,16 @@ class IntradayFetcher(KiteFetcher):
                 df["symbol"] = tradingsymbol
                 df["interval"] = interval
                 return df[
-                    ["symbol", "interval", "trade_datetime", "open", "high", "low", "close", "volume"]
+                    [
+                        "symbol",
+                        "interval",
+                        "trade_datetime",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                    ]
                 ]
             except Exception as exc:
                 logger.warning(
@@ -93,7 +125,7 @@ class IntradayFetcher(KiteFetcher):
         days: int = 30,
     ) -> list[pd.DataFrame]:
         results: list[pd.DataFrame] = []
-        for underlying in DEFAULT_FNO_UNDERLYINGS:
+        for underlying in FNO_INDEX_UNDERLYINGS:
             ts = self.nearest_future_symbol(underlying)
             if ts is None:
                 logger.warning("No future found for %s", underlying)

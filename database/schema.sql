@@ -121,6 +121,15 @@ CREATE TABLE IF NOT EXISTS portfolio_holdings (
     UNIQUE(scan_run_id, symbol)
 );
 
+CREATE TABLE IF NOT EXISTS portfolio_scan_log (
+    scan_run_id VARCHAR PRIMARY KEY,
+    processed_at TIMESTAMP NOT NULL,
+    holdings_added INTEGER DEFAULT 0
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_portfolio_symbol_date
+    ON portfolio_holdings(symbol, purchase_date);
+
 CREATE INDEX IF NOT EXISTS idx_portfolio_symbol ON portfolio_holdings(symbol);
 CREATE INDEX IF NOT EXISTS idx_portfolio_purchase ON portfolio_holdings(purchase_date);
 CREATE INDEX IF NOT EXISTS idx_portfolio_scan ON portfolio_holdings(scan_run_id);
