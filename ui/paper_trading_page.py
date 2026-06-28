@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -350,6 +352,10 @@ def render_portfolio_sidebar(db: DuckDBManager) -> None:
     st.sidebar.markdown("---")
     st.sidebar.subheader("Portfolio")
 
+    pending = db.count_unprocessed_equity_scan_runs()
+    if pending > 0:
+        st.sidebar.warning(f"{pending} scan(s) waiting to sync")
+
     service = PaperTradingService(db=db)
     summary = service.summarize_portfolio()
 
@@ -489,6 +495,66 @@ def _render_holdings_by_date(df: pd.DataFrame, date_filter: str | None) -> None:
                 _holdings_table(sub)
 
 
+def render_sync_feedback(sync: dict[str, Any], *, always_show: bool = False) -> None:
+    """Show portfolio sync results after importing scan picks."""
+    added = sync.get("holdings_added", 0)
+    processed = sync.get("scans_processed", 0)
+    pending = sync.get("scans_pending", processed)
+    skipped_picks = sync.get("skipped_picks", [])
+
+    if added > 0:
+        st.success(
+            f"Added {added} new holding(s) from {processed} scan(s). "
+            f"Portfolio total: {sync.get('total_holdings', 0)}."
+        )
+    elif processed > 0:
+        st.info(
+            f"Imported {processed} new scan(s); no new holdings were added."
+        )
+    elif always_show and pending == 0:
+        st.caption("Portfolio is up to date with all saved scans.")
+
+    if skipped_picks:
+        st.markdown("**Scan picks not added**")
+        rows = []
+        for pick in skipped_picks:
+            rows.append(
+                {
+                    "Symbol": pick["symbol"],
+                    "Signal date": _fmt_date(pick["purchase_date"]),
+                    "From scan as": pick.get("requested_strategy", "—"),
+                    "Why": (
+                        pick.get("detail", pick.get("reason", ""))
+                        .replace("**", "")
+                    ),
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "One share per symbol per signal date. If a stock triggered in multiple "
+            "strategies, check the **Confluence** section on that date — not Basic Breakout."
+        )
+    elif processed > 0 and added == 0:
+        st.caption("No eligible picks in the processed scan(s).")
+
+    if sync.get("duplicates_removed", 0) > 0:
+        st.caption(f"Removed {sync['duplicates_removed']} duplicate holding(s).")
+    if sync.get("rs_cleanup_removed", 0) > 0:
+        st.info(
+            f"One-time cleanup: removed {sync['rs_cleanup_removed']} extra RS Leader "
+            f"holdings (kept top 5 per day)."
+        )
+    if sync.get("max_price_cleanup_removed", 0) > 0:
+        st.info(
+            f"One-time cleanup: removed {sync['max_price_cleanup_removed']} holding(s) "
+            f"above ₹{MAX_SHARE_PRICE_INR:,.0f} per share."
+        )
+
+
 def render_paper_trading_page(db: DuckDBManager) -> None:
     _inject_styles()
 
@@ -504,24 +570,15 @@ def render_paper_trading_page(db: DuckDBManager) -> None:
     )
 
     service = PaperTradingService(db=db)
+    pending = db.count_unprocessed_equity_scan_runs()
+    hero_cols = st.columns([3, 1])
+    with hero_cols[1]:
+        sync_clicked = st.button("Sync from scans", use_container_width=True, type="primary")
+    if pending > 0 and not sync_clicked:
+        st.caption(f"{pending} saved scan(s) not yet in the portfolio — syncing now…")
+
     sync = service.sync_portfolio_from_scans()
-    if sync["holdings_added"] > 0:
-        st.success(
-            f"Imported {sync['holdings_added']} holdings from "
-            f"{sync['scans_processed']} past scan(s)."
-        )
-    if sync.get("duplicates_removed", 0) > 0:
-        st.caption(f"Removed {sync['duplicates_removed']} duplicate holding(s).")
-    if sync.get("rs_cleanup_removed", 0) > 0:
-        st.info(
-            f"One-time cleanup: removed {sync['rs_cleanup_removed']} extra RS Leader "
-            f"holdings (kept top 5 per day)."
-        )
-    if sync.get("max_price_cleanup_removed", 0) > 0:
-        st.info(
-            f"One-time cleanup: removed {sync['max_price_cleanup_removed']} holding(s) "
-            f"above ₹{MAX_SHARE_PRICE_INR:,.0f} per share."
-        )
+    render_sync_feedback(sync, always_show=sync_clicked)
 
     summary = service.summarize_portfolio()
 
@@ -558,8 +615,23 @@ def render_paper_trading_page(db: DuckDBManager) -> None:
         _render_overview_charts(service, df)
 
     with tab_holdings:
-        selected_date = st.selectbox("Filter by purchase date", date_options, index=0)
+        filter_cols = st.columns([2, 1])
+        with filter_cols[0]:
+            symbol_filter = st.text_input(
+                "Find symbol",
+                placeholder="e.g. RELIANCE",
+            ).strip().upper()
+        with filter_cols[1]:
+            selected_date = st.selectbox("Filter by purchase date", date_options, index=0)
+        holdings_df = df
+        if symbol_filter:
+            holdings_df = holdings_df[
+                holdings_df["symbol"].str.upper().str.contains(symbol_filter, na=False)
+            ]
+            if holdings_df.empty:
+                st.info(f"No holdings matching **{symbol_filter}**.")
+                return
         _render_holdings_by_date(
-            df,
+            holdings_df,
             None if selected_date == "All dates" else selected_date,
         )

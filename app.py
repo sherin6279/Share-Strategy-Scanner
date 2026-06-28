@@ -20,7 +20,11 @@ from exports.export_service import export_csv, export_excel, prepare_display_df
 from scanners.scanner import Scanner
 from strategies.strategy_engine import STRATEGIES
 from ui.pages_extra import render_backtest_page, render_fno_page
-from ui.paper_trading_page import render_paper_trading_page, render_portfolio_sidebar
+from ui.paper_trading_page import (
+    render_paper_trading_page,
+    render_portfolio_sidebar,
+    render_sync_feedback,
+)
 from paper_trading.service import PaperTradingService
 
 # Page config
@@ -222,9 +226,9 @@ def _run_refresh(db: DuckDBManager) -> None:
         return
 
     progress = st.progress(0, text="Starting refresh...")
-    status = st.empty()
+    status_line = st.empty()
 
-    def callback(current: int, total: int, symbol: str, status: str = "updating") -> None:
+    def callback(current: int, total: int, symbol: str, action: str = "updating") -> None:
         pct = current / total
         labels = {
             "skipped": "Skipping (current)",
@@ -232,9 +236,9 @@ def _run_refresh(db: DuckDBManager) -> None:
             "updating": "Updating",
             "failed": "Failed",
         }
-        label = labels.get(status, "Fetching")
+        label = labels.get(action, "Fetching")
         progress.progress(pct, text=f"{label} {current} / {total} — {symbol}")
-        status.caption(f"{label}: {symbol}")
+        status_line.caption(f"{label}: {symbol}")
 
     try:
         service = RefreshService(db=db, fetcher=fetcher)
@@ -251,14 +255,24 @@ def _run_refresh(db: DuckDBManager) -> None:
         rows = summary.get("rows_upserted", 0)
         elapsed_msg = f"{elapsed:.1f}s"
 
-        if updated == 0 and n_failed == 0 and skipped > 0:
+        if summary.get("token_invalid"):
+            st.error(
+                f"Kite access token is invalid or expired ({n_failed} symbols not updated). "
+                "Use **Verify Token** or re-login in the sidebar, then refresh again."
+            )
+        elif updated == 0 and n_failed == 0 and skipped > 0:
             st.success(
                 f"All {skipped} symbols already up to date in {elapsed_msg}."
             )
+        elif updated == 0 and n_failed > 0 and skipped > 0:
+            st.warning(
+                f"No new candles added. {skipped} symbols already current, "
+                f"{n_failed} could not be updated in {elapsed_msg}."
+            )
         elif updated == 0 and n_failed > 0:
             st.error(
-                f"Refresh failed — 0 symbols updated ({n_failed} failed) in {elapsed_msg}. "
-                "Your access token is likely expired. Use 'Verify Token' or re-login via the sidebar."
+                f"Refresh failed — {n_failed} symbol(s) could not be updated in {elapsed_msg}. "
+                "See the failed list below."
             )
         elif n_failed > 10:
             st.warning(
@@ -272,8 +286,12 @@ def _run_refresh(db: DuckDBManager) -> None:
             )
 
         if summary["failed_symbols"]:
-            with st.expander(f"Failed symbols ({n_failed})"):
+            with st.expander(f"Failed symbols ({n_failed})", expanded=n_failed <= 10):
                 st.write(summary["failed_symbols"])
+                st.caption(
+                    "Often renamed/delisted NIFTY 500 constituents or symbols missing from NSE. "
+                    "If the list is long, re-login to Kite first."
+                )
     except Exception as exc:
         st.error(f"Refresh failed: {exc}")
 
@@ -312,27 +330,12 @@ def _run_scan(db: DuckDBManager) -> None:
                 )
 
             try:
-                paper = PaperTradingService(db=db).record_from_scan(summary["scan_run_id"])
-                if paper.get("already_recorded"):
-                    st.caption("Portfolio: this scan was already saved")
-                elif paper.get("holdings_added", 0) == 0:
-                    skipped = paper.get("holdings_skipped_duplicate", 0)
-                    st.caption(
-                        f"Portfolio: no new picks "
-                        f"({skipped} already held today)" if skipped else "Portfolio: no new picks"
-                    )
-                else:
-                    conf = paper.get("confluence_count", 0)
-                    skipped = paper.get("holdings_skipped_duplicate", 0)
-                    msg = (
-                        f"Portfolio: added {paper['holdings_added']} new picks "
-                        f"({conf} confluence)"
-                    )
-                    if skipped:
-                        msg += f", {skipped} skipped (already held today)"
-                    st.caption(msg)
+                sync = PaperTradingService(db=db).sync_portfolio_from_scans()
+                st.session_state["portfolio_sync_notice"] = sync
             except Exception as paper_exc:
-                st.warning(f"Portfolio not updated: {paper_exc}")
+                st.session_state["portfolio_sync_notice"] = {
+                    "error": str(paper_exc),
+                }
 
             st.rerun()
         except Exception as exc:
@@ -481,6 +484,13 @@ def main() -> None:
     except RuntimeError as exc:
         st.error(str(exc))
         st.stop()
+
+    notice = st.session_state.pop("portfolio_sync_notice", None)
+    if notice:
+        if notice.get("error"):
+            st.warning(f"Portfolio not updated: {notice['error']}")
+        else:
+            render_sync_feedback(notice, always_show=True)
 
     render_portfolio_sidebar(db)
 

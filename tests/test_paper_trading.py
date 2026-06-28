@@ -139,14 +139,17 @@ def test_sync_imports_historical_scans(paper_db):
         ],
     )
     svc = PaperTradingService(db=paper_db)
+    assert paper_db.count_unprocessed_equity_scan_runs() == 2
     sync = svc.sync_portfolio_from_scans()
+    assert sync["scans_pending"] == 2
     assert sync["holdings_added"] == 3
     assert sync["scans_processed"] == 2
     assert len(svc.get_portfolio()) == 3
 
     again = svc.sync_portfolio_from_scans()
     assert again["holdings_added"] == 0
-    assert again["scans_skipped"] == 2
+    assert again["scans_processed"] == 0
+    assert again["scans_pending"] == 0
 
 
 def test_portfolio_pl_uses_latest_close(paper_db):

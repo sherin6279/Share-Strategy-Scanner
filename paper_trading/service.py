@@ -109,11 +109,12 @@ class PaperTradingService:
         rs_cleanup = self.run_one_time_rs_cleanup()
         price_cleanup = self.run_one_time_max_price_cleanup()
         removed = self.db.dedupe_portfolio_holdings()
-        runs = self.db.list_equity_scan_runs_chronological()
+        runs = self.db.list_unprocessed_equity_scan_runs()
+        scans_pending = len(runs)
         scans_processed = 0
         total_added = 0
-        skipped_scans = 0
         empty_scans = 0
+        skipped_picks: list[dict[str, Any]] = []
 
         for run in runs:
             run_id = run.get("run_id")
@@ -122,20 +123,20 @@ class PaperTradingService:
                 if scan_ts is None:
                     continue
                 run_id = f"legacy_{pd.Timestamp(scan_ts).strftime('%Y%m%d_%H%M%S')}"
-            if self.db.portfolio_scan_processed(run_id):
-                skipped_scans += 1
-                continue
             result = self.record_from_scan(run_id, scan_timestamp=scan_ts)
             scans_processed += 1
             total_added += result.get("holdings_added", 0)
+            skipped_picks.extend(result.get("skipped_picks", []))
             if result.get("empty_scan"):
                 empty_scans += 1
 
         return {
             "scans_processed": scans_processed,
-            "scans_skipped": skipped_scans,
+            "scans_pending": scans_pending,
+            "scans_skipped": 0,
             "empty_scans": empty_scans,
             "holdings_added": total_added,
+            "skipped_picks": skipped_picks,
             "duplicates_removed": removed,
             "rs_cleanup_removed": rs_cleanup.get("removed", 0),
             "max_price_cleanup_removed": price_cleanup.get("removed", 0),
@@ -158,17 +159,20 @@ class PaperTradingService:
             holdings = self.db.list_portfolio_holdings()
             n = len(holdings[holdings["scan_run_id"] == scan_run_id])
             logger.info("Scan %s already in portfolio log", scan_run_id)
+            skipped_picks = self._skipped_picks_for_scan(scan_run_id, scan_timestamp)
             return {
                 "scan_run_id": scan_run_id,
                 "holdings_added": 0,
-                "holdings_skipped_duplicate": 0,
+                "holdings_skipped_duplicate": len(skipped_picks),
                 "holdings_count": n,
                 "already_recorded": True,
+                "skipped_picks": skipped_picks,
             }
 
         scan_df = self.db.get_scan_results(
             scan_run_id=scan_run_id, scan_timestamp=scan_timestamp
         )
+        filtered_picks = self._price_filtered_picks_from_df(scan_df)
         scan_df = apply_scan_df_filters(scan_df)
         if scan_df.empty:
             logger.warning("No scan results for run %s — marking as processed", scan_run_id)
@@ -180,11 +184,13 @@ class PaperTradingService:
                 "holdings_count": 0,
                 "already_recorded": False,
                 "empty_scan": True,
+                "skipped_picks": filtered_picks,
             }
 
         created_at = datetime.now()
         candidates = self._build_holdings_from_scan(scan_df, scan_run_id, created_at)
-        holdings, skipped = self._filter_duplicate_symbol_dates(candidates)
+        holdings, skipped, skipped_picks = self._filter_duplicate_symbol_dates(candidates)
+        skipped_picks = filtered_picks + skipped_picks
 
         added = 0
         if holdings:
@@ -202,23 +208,108 @@ class PaperTradingService:
                 1 for h in holdings if h["source_type"] == CONFLUENCE_TYPE
             ),
             "already_recorded": False,
+            "skipped_picks": skipped_picks,
         }
+
+    def _price_filtered_picks_from_df(self, raw_df: pd.DataFrame) -> list[dict[str, Any]]:
+        if raw_df.empty or "trigger_price" not in raw_df.columns:
+            return []
+
+        skipped: list[dict[str, Any]] = []
+        for row in raw_df.itertuples(index=False):
+            price = float(row.trigger_price)
+            if price <= MAX_SHARE_PRICE_INR:
+                continue
+            skipped.append(
+                {
+                    "symbol": row.symbol,
+                    "purchase_date": pd.to_datetime(row.signal_date).date(),
+                    "requested_strategy": STRATEGY_NAMES.get(
+                        int(row.strategy_id), f"S{row.strategy_id}"
+                    ),
+                    "reason": "price_cap",
+                    "detail": f"₹{price:,.0f} exceeds ₹{MAX_SHARE_PRICE_INR:,.0f} cap",
+                }
+            )
+        return skipped
+
+    def _skipped_picks_for_scan(
+        self,
+        scan_run_id: str,
+        scan_timestamp: datetime | None,
+    ) -> list[dict[str, Any]]:
+        """Explain why current scan picks are not new portfolio rows."""
+        scan_df = self.db.get_scan_results(
+            scan_run_id=scan_run_id, scan_timestamp=scan_timestamp
+        )
+        if scan_df.empty:
+            return []
+
+        skipped = self._price_filtered_picks_from_df(scan_df)
+        filtered = apply_scan_df_filters(scan_df)
+        if filtered.empty:
+            return skipped
+
+        candidates = self._build_holdings_from_scan(
+            filtered,
+            scan_run_id,
+            datetime.now(),
+        )
+        existing_sources = self.db.get_portfolio_symbol_date_sources()
+        holdings_from_scan = self.db.list_portfolio_holdings()
+        scan_symbols = (
+            set(holdings_from_scan[holdings_from_scan["scan_run_id"] == scan_run_id]["symbol"])
+            if not holdings_from_scan.empty
+            else set()
+        )
+
+        for candidate in candidates:
+            key = (candidate["symbol"], candidate["purchase_date"])
+            if candidate["symbol"] in scan_symbols:
+                continue
+            if key not in existing_sources:
+                continue
+            skipped.append(
+                {
+                    "symbol": candidate["symbol"],
+                    "purchase_date": candidate["purchase_date"],
+                    "requested_strategy": candidate["source_label"],
+                    "reason": "already_held",
+                    "detail": f"Already in portfolio as **{existing_sources[key]}**",
+                    "existing_strategy": existing_sources[key],
+                }
+            )
+        return skipped
 
     def _filter_duplicate_symbol_dates(
         self,
         holdings: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
         existing = self.db.get_portfolio_symbol_dates()
+        existing_sources = self.db.get_portfolio_symbol_date_sources()
         kept: list[dict[str, Any]] = []
         skipped = 0
+        skipped_picks: list[dict[str, Any]] = []
         for h in holdings:
             key = (h["symbol"], h["purchase_date"])
             if key in existing:
                 skipped += 1
+                existing_label = existing_sources.get(key, "Unknown")
+                skipped_picks.append(
+                    {
+                        "symbol": h["symbol"],
+                        "purchase_date": h["purchase_date"],
+                        "requested_strategy": h["source_label"],
+                        "reason": "already_held",
+                        "detail": f"Already in portfolio as **{existing_label}**",
+                        "existing_strategy": existing_label,
+                    }
+                )
                 continue
             kept.append(h)
             existing.add(key)
-        return kept, skipped
+            existing_sources[key] = h["source_label"]
+        return kept, skipped, skipped_picks
 
     def _build_holdings_from_scan(
         self,

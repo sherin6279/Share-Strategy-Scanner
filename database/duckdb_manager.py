@@ -665,6 +665,27 @@ class DuckDBManager:
             result.add((sym, d))
         return result
 
+    def get_portfolio_symbol_date_sources(self) -> dict[tuple[str, date], str]:
+        """Map (symbol, purchase_date) to portfolio strategy label."""
+        df = self.conn.execute(
+            """
+            SELECT symbol, purchase_date, source_type, source_label
+            FROM portfolio_holdings
+            """
+        ).fetchdf()
+        if df.empty:
+            return {}
+
+        out: dict[tuple[str, date], str] = {}
+        for _, row in df.iterrows():
+            pd_val = row["purchase_date"]
+            d = pd_val.date() if hasattr(pd_val, "date") else pd_val
+            label = row["source_label"]
+            if row["source_type"] == "confluence":
+                label = "Confluence"
+            out[(row["symbol"], d)] = label
+        return out
+
     def insert_portfolio_holdings(self, holdings: list[dict[str, Any]]) -> int:
         if not holdings:
             return 0
@@ -701,6 +722,30 @@ class DuckDBManager:
     def list_equity_scan_runs_chronological(self, limit: int = 500) -> list[dict]:
         runs = self.list_scan_runs(segment="equity", limit=limit)
         return sorted(runs, key=lambda r: r["scan_timestamp"])
+
+    def list_unprocessed_equity_scan_runs(self) -> list[dict]:
+        """Equity scan runs not yet imported into the portfolio."""
+        rows = self.conn.execute(
+            """
+            SELECT r.run_id, r.scan_timestamp
+            FROM scan_runs AS r
+            WHERE r.segment = 'equity'
+              AND r.run_id NOT IN (SELECT scan_run_id FROM portfolio_scan_log)
+            ORDER BY r.scan_timestamp
+            """
+        ).fetchall()
+        return [{"run_id": row[0], "scan_timestamp": row[1]} for row in rows]
+
+    def count_unprocessed_equity_scan_runs(self) -> int:
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM scan_runs AS r
+            WHERE r.segment = 'equity'
+              AND r.run_id NOT IN (SELECT scan_run_id FROM portfolio_scan_log)
+            """
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     def list_portfolio_holdings(self) -> pd.DataFrame:
         return self.conn.execute(

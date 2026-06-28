@@ -58,12 +58,33 @@ class RefreshService:
 
         latest_dates = self.db.get_latest_candle_dates(all_symbols)
         latest_market_date = self._resolve_latest_market_date(latest_dates)
+        symbols_to_fetch = self._symbols_needing_fetch(
+            all_symbols, latest_dates, latest_market_date
+        )
 
         logger.info(
-            "Incremental refresh for %d symbols (latest market session: %s)",
+            "Incremental refresh for %d symbols (%d to fetch, latest session: %s)",
             len(all_symbols),
+            len(symbols_to_fetch),
             latest_market_date,
         )
+
+        token_invalid = False
+        if symbols_to_fetch and not self.fetcher.validate_token():
+            token_invalid = True
+            logger.error("Access token is invalid or expired — aborting refresh")
+            return self._build_summary(
+                latest_market_date=latest_market_date,
+                updated=[],
+                skipped=[
+                    s
+                    for s in all_symbols
+                    if s not in symbols_to_fetch
+                ],
+                failed=symbols_to_fetch,
+                total_rows=0,
+                token_invalid=True,
+            )
 
         total = len(all_symbols)
         updated: list[str] = []
@@ -95,15 +116,6 @@ class RefreshService:
             if df.empty:
                 if stored_date is None:
                     failed.append(symbol)
-                    if i == 1 and not self.fetcher.validate_token():
-                        remaining = all_symbols[i:]
-                        logger.error(
-                            "Access token is invalid or expired. Aborting fetch — "
-                            "%d symbols skipped.",
-                            len(remaining),
-                        )
-                        failed.extend(s for s in remaining if s not in failed)
-                        break
                 else:
                     skipped.append(symbol)
                 continue
@@ -112,6 +124,38 @@ class RefreshService:
             updated.append(symbol)
             latest_dates[symbol] = pd.to_datetime(df["trade_date"]).max().date()
 
+        return self._build_summary(
+            latest_market_date=latest_market_date,
+            updated=updated,
+            skipped=skipped,
+            failed=failed,
+            total_rows=total_rows,
+            token_invalid=token_invalid,
+        )
+
+    def _symbols_needing_fetch(
+        self,
+        all_symbols: list[str],
+        latest_dates: dict[str, date],
+        latest_market_date: date,
+    ) -> list[str]:
+        needing: list[str] = []
+        for symbol in all_symbols:
+            stored_date = latest_dates.get(symbol)
+            if stored_date is None or stored_date < latest_market_date:
+                needing.append(symbol)
+        return needing
+
+    def _build_summary(
+        self,
+        *,
+        latest_market_date: date,
+        updated: list[str],
+        skipped: list[str],
+        failed: list[str],
+        total_rows: int,
+        token_invalid: bool = False,
+    ) -> dict:
         timestamp = datetime.now().isoformat()
         self.db.set_metadata("last_refresh_timestamp", timestamp)
         self.db.set_metadata("last_refresh_symbol_count", str(len(updated)))
@@ -133,6 +177,7 @@ class RefreshService:
             "failed_symbols": failed,
             "rows_upserted": total_rows,
             "initial_backfill_days": CANDLE_DAYS,
+            "token_invalid": token_invalid,
         }
 
     def _resolve_latest_market_date(self, latest_dates: dict[str, date]) -> date:
