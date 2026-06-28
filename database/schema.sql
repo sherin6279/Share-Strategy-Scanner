@@ -104,3 +104,23 @@ CREATE TABLE IF NOT EXISTS paper_trade_positions (
 
 CREATE INDEX IF NOT EXISTS idx_paper_positions_batch ON paper_trade_positions(batch_id);
 CREATE INDEX IF NOT EXISTS idx_paper_batches_scan ON paper_trade_batches(scan_run_id);
+
+-- Paper portfolio: cumulative holdings (1 share per scan pick)
+CREATE TABLE IF NOT EXISTS portfolio_holdings (
+    holding_id VARCHAR PRIMARY KEY,
+    scan_run_id VARCHAR NOT NULL,
+    symbol VARCHAR NOT NULL,
+    source_type VARCHAR NOT NULL,
+    source_label VARCHAR NOT NULL,
+    strategy_ids JSON,
+    purchase_date DATE NOT NULL,
+    purchase_price DOUBLE NOT NULL,
+    quantity INTEGER DEFAULT 1,
+    score DOUBLE,
+    created_at TIMESTAMP NOT NULL,
+    UNIQUE(scan_run_id, symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_symbol ON portfolio_holdings(symbol);
+CREATE INDEX IF NOT EXISTS idx_portfolio_purchase ON portfolio_holdings(purchase_date);
+CREATE INDEX IF NOT EXISTS idx_portfolio_scan ON portfolio_holdings(scan_run_id);

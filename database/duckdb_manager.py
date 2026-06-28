@@ -515,6 +515,57 @@ class DuckDBManager:
             return pd.DataFrame()
         return self.get_fno_scan_results(scan_timestamp=ts)
 
+    def insert_portfolio_holdings(self, holdings: list[dict[str, Any]]) -> int:
+        if not holdings:
+            return 0
+        rows = [
+            (
+                h["holding_id"],
+                h["scan_run_id"],
+                h["symbol"],
+                h["source_type"],
+                h["source_label"],
+                json.dumps(h.get("strategy_ids", [])),
+                h["purchase_date"],
+                h["purchase_price"],
+                h.get("quantity", 1),
+                h.get("score"),
+                h["created_at"],
+            )
+            for h in holdings
+        ]
+        self.conn.executemany(
+            """
+            INSERT INTO portfolio_holdings
+            (holding_id, scan_run_id, symbol, source_type, source_label,
+             strategy_ids, purchase_date, purchase_price, quantity, score, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        return len(rows)
+
+    def portfolio_exists_for_scan(self, scan_run_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM portfolio_holdings WHERE scan_run_id = ? LIMIT 1",
+            [scan_run_id],
+        ).fetchone()
+        return row is not None
+
+    def list_portfolio_holdings(self) -> pd.DataFrame:
+        return self.conn.execute(
+            """
+            SELECT holding_id, scan_run_id, symbol, source_type, source_label,
+                   strategy_ids, purchase_date, purchase_price, quantity, score, created_at
+            FROM portfolio_holdings
+            ORDER BY purchase_date DESC, symbol
+            """
+        ).fetchdf()
+
+    def count_portfolio_holdings(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) FROM portfolio_holdings").fetchone()
+        return int(row[0]) if row else 0
+
     def insert_paper_trade_batch(
         self,
         batch_id: str,

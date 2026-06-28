@@ -20,7 +20,7 @@ from exports.export_service import export_csv, export_excel, prepare_display_df
 from scanners.scanner import Scanner
 from strategies.strategy_engine import STRATEGIES
 from ui.pages_extra import render_backtest_page, render_fno_page
-from ui.paper_trading_page import render_paper_trading_page
+from ui.paper_trading_page import render_paper_trading_page, render_portfolio_sidebar
 from paper_trading.service import PaperTradingService
 
 # Page config
@@ -299,14 +299,17 @@ def _run_scan(db: DuckDBManager) -> None:
             try:
                 paper = PaperTradingService(db=db).record_from_scan(summary["scan_run_id"])
                 if paper.get("already_recorded"):
-                    st.caption(f"Paper trade batch already saved ({paper['position_count']} picks)")
-                else:
                     st.caption(
-                        f"Paper trade: saved {paper['position_count']} picks at entry prices "
-                        f"(batch `{paper['batch_id']}`)"
+                        f"Portfolio: {paper['holdings_count']} holdings already saved for this scan"
+                    )
+                else:
+                    conf = paper.get("confluence_count", 0)
+                    st.caption(
+                        f"Portfolio: bought 1 share each of {paper['holdings_added']} picks "
+                        f"({conf} confluence)"
                     )
             except Exception as paper_exc:
-                st.warning(f"Paper trade not saved: {paper_exc}")
+                st.warning(f"Portfolio not updated: {paper_exc}")
 
             st.rerun()
         except Exception as exc:
@@ -450,9 +453,11 @@ def main() -> None:
         st.error(str(exc))
         st.stop()
 
+    render_portfolio_sidebar(db)
+
     mode = st.sidebar.radio(
         "Segment",
-        ["Equity", "Paper Trading", "F&O Intraday", "Backtest"],
+        ["Equity", "Portfolio", "F&O Intraday", "Backtest"],
         index=0,
     )
 
@@ -492,7 +497,7 @@ def main() -> None:
             render_confluence_tab(
                 scanner, scan_run_id=scan_run_id, scan_timestamp=scan_ts
             )
-    elif mode == "Paper Trading":
+    elif mode == "Portfolio":
         render_paper_trading_page(db)
     elif mode == "F&O Intraday":
         render_fno_page(db, get_fetcher)
@@ -506,8 +511,7 @@ def main() -> None:
         st.write(f"NIFTY 50 loaded: {NIFTY50_SYMBOL in symbols}")
         fno_syms = db.get_intraday_symbols()
         st.write(f"F&O intraday symbols: {len(fno_syms)}")
-        paper_batches = db.list_paper_trade_batches(limit=5)
-        st.write(f"Paper trade batches: {len(paper_batches)}")
+        st.write(f"Portfolio holdings: {db.count_portfolio_holdings()}")
         if st.session_state.refresh_summary:
             st.json(st.session_state.refresh_summary)
 

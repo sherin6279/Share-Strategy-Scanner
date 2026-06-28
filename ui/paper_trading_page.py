@@ -1,164 +1,170 @@
-"""Streamlit UI for paper trading P/L tracking."""
+"""Portfolio UI — holdings and sidebar summary."""
 
 from __future__ import annotations
 
-import pandas as pd
 import streamlit as st
 
 from database.duckdb_manager import DuckDBManager
 from paper_trading.service import PaperTradingService
 
 
-def _fmt_ts(ts) -> str:
-    if ts is None:
-        return ""
-    if isinstance(ts, str):
-        return ts.replace("T", " ")[:19]
-    return ts.strftime("%Y-%m-%d %H:%M:%S")
-
-
 def _fmt_date(d) -> str:
     if d is None:
-        return ""
+        return "—"
     if isinstance(d, str):
         return d[:10]
     return d.strftime("%Y-%m-%d")
 
 
+def render_portfolio_sidebar(db: DuckDBManager) -> None:
+    """Compact portfolio summary always visible in the sidebar."""
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Portfolio")
+
+    service = PaperTradingService(db=db)
+    summary = service.summarize_portfolio()
+
+    if summary["holding_count"] == 0:
+        st.sidebar.caption("No holdings yet. Run a scan to add picks.")
+        return
+
+    st.sidebar.metric("Holdings", summary["holding_count"])
+    pl = summary["total_pl_amount"]
+    pl_pct = summary["total_pl_pct"]
+    st.sidebar.metric(
+        "Total P/L",
+        f"₹{pl:+,.2f}" if pl is not None else "—",
+        delta=f"{pl_pct:+.2f}%" if pl_pct is not None else None,
+    )
+    st.sidebar.caption(f"Prices as of {_fmt_date(summary['latest_price_date'])}")
+
+    df = service.get_portfolio()
+    if not df.empty and df["pl_pct"].notna().any():
+        top = df.nlargest(3, "pl_pct")[["symbol", "pl_pct"]]
+        st.sidebar.caption("Top movers")
+        for _, row in top.iterrows():
+            st.sidebar.write(f"{row['symbol']}: {row['pl_pct']:+.1f}%")
+
+
 def render_paper_trading_page(db: DuckDBManager) -> None:
-    st.subheader("Paper Trading")
+    st.subheader("Portfolio")
     st.caption(
-        "Each equity scan is saved here at the signal-day close price. "
-        "After a few days, refresh market data and review actual P/L."
+        "Each scan adds 1 share per pick at that day's close. "
+        "Confluence picks (2+ strategies) appear as a single holding. "
+        "Refresh market data to update P/L."
     )
 
     service = PaperTradingService(db=db)
-    batches = db.list_paper_trade_batches()
+    summary = service.summarize_portfolio()
 
-    if not batches:
-        st.info(
-            "No paper trades yet. Run an **Equity** scan — picks are recorded automatically."
-        )
+    if summary["holding_count"] == 0:
+        st.info("No holdings yet. Run an **Equity** scan — picks are added automatically.")
         return
 
-    labels = [
-        f"{_fmt_ts(b['created_at'])} — {b['position_count']} picks (entry {_fmt_date(b['entry_date'])})"
-        for b in batches
-    ]
-    choice = st.selectbox("Paper trade batch", labels, index=0)
-    batch = batches[labels.index(choice)]
-    batch_id = batch["batch_id"]
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        min_hold = st.number_input(
-            "Min hold days",
-            min_value=0,
-            max_value=30,
-            value=2,
-            help="Show only positions held at least this many calendar days",
-        )
-    with col2:
-        st.metric("Entry date", _fmt_date(batch["entry_date"]))
-    with col3:
-        if batch.get("scan_run_id"):
-            st.caption(f"Scan run: `{batch['scan_run_id']}`")
-
-    summary = service.summarize_pl(batch_id, min_hold_days=int(min_hold))
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     with m1:
-        st.metric("Positions", summary["position_count"])
+        st.metric("Holdings", summary["holding_count"])
     with m2:
-        wr = summary["win_rate"]
-        st.metric("Win rate", f"{wr:.1f}%" if wr is not None else "—")
+        st.metric("Invested", f"₹{summary['total_cost']:,.2f}")
     with m3:
-        avg = summary["avg_pl_pct"]
-        st.metric("Avg P/L %", f"{avg:+.2f}%" if avg is not None else "—")
+        st.metric("Market value", f"₹{summary['total_market_value']:,.2f}")
     with m4:
-        st.metric(
-            "Price as of",
-            _fmt_date(summary.get("latest_price_date")),
-        )
+        pl = summary["total_pl_amount"]
+        st.metric("Total P/L", f"₹{pl:+,.2f}" if pl is not None else "—")
+    with m5:
+        wr = summary["win_rate"]
+        st.metric("Win rate", f"{wr:.0f}%" if wr is not None else "—")
 
-    if summary["with_prices"] == 0:
-        st.warning(
-            "No updated prices found. Click **Refresh Market Data** on the Equity tab first."
-        )
+    st.caption(f"Prices as of **{_fmt_date(summary['latest_price_date'])}**")
 
-    pl_df = service.compute_pl(batch_id, min_hold_days=int(min_hold))
-    if pl_df.empty:
-        st.info(f"No positions held for at least {min_hold} day(s) yet.")
-        return
+    if summary["holding_count"] > 0 and summary["total_market_value"] == 0:
+        st.warning("Refresh market data on the Equity tab to load current prices.")
 
-    display = pl_df.rename(
+    df = service.get_portfolio()
+    display = df.rename(
         columns={
             "symbol": "Symbol",
-            "strategy_name": "Strategy",
-            "entry_date": "Entry Date",
-            "entry_price": "Entry Price",
-            "current_date": "Price Date",
+            "source": "Bought From",
+            "purchase_date": "Bought On",
+            "purchase_price": "Buy Price",
+            "quantity": "Qty",
             "current_price": "Current Price",
-            "days_held": "Days Held",
+            "market_value": "Market Value",
             "pl_amount": "P/L ₹",
             "pl_pct": "P/L %",
+            "days_held": "Days Held",
             "score": "Score",
         }
     )
-    display["Entry Date"] = display["Entry Date"].apply(_fmt_date)
-    display["Price Date"] = display["Price Date"].apply(_fmt_date)
-
-    if "P/L %" in display.columns:
-        display = display.sort_values("P/L %", ascending=False, na_position="last")
+    display["Bought On"] = display["Bought On"].apply(_fmt_date)
+    display = display.sort_values(["Bought On", "Symbol"], ascending=[False, True])
 
     st.dataframe(
         display[
             [
                 "Symbol",
-                "Strategy",
-                "Entry Date",
-                "Entry Price",
-                "Price Date",
+                "Bought From",
+                "Bought On",
+                "Buy Price",
+                "Qty",
                 "Current Price",
-                "Days Held",
+                "Market Value",
                 "P/L ₹",
                 "P/L %",
+                "Days Held",
                 "Score",
             ]
         ],
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Entry Price": st.column_config.NumberColumn(format="₹%.2f"),
+            "Buy Price": st.column_config.NumberColumn(format="₹%.2f"),
             "Current Price": st.column_config.NumberColumn(format="₹%.2f"),
+            "Market Value": st.column_config.NumberColumn(format="₹%.2f"),
             "P/L ₹": st.column_config.NumberColumn(format="₹%+.2f"),
             "P/L %": st.column_config.NumberColumn(format="%+.2f%%"),
             "Score": st.column_config.NumberColumn(format="%.2f"),
         },
     )
 
-    winners = pl_df[pl_df["pl_pct"].notna() & (pl_df["pl_pct"] > 0)]
-    losers = pl_df[pl_df["pl_pct"].notna() & (pl_df["pl_pct"] < 0)]
-
+    winners = df[df["pl_amount"].notna() & (df["pl_amount"] > 0)]
+    losers = df[df["pl_amount"].notna() & (df["pl_amount"] < 0)]
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown("**Top gainers**")
+        st.markdown("**Best performers**")
         if winners.empty:
-            st.caption("None yet")
+            st.caption("—")
         else:
-            top = winners.nlargest(5, "pl_pct")[["symbol", "pl_pct", "days_held"]]
             st.dataframe(
-                top.rename(columns={"symbol": "Symbol", "pl_pct": "P/L %", "days_held": "Days"}),
+                winners.nlargest(5, "pl_pct")[
+                    ["symbol", "source", "pl_pct", "days_held"]
+                ].rename(
+                    columns={
+                        "symbol": "Symbol",
+                        "source": "Bought From",
+                        "pl_pct": "P/L %",
+                        "days_held": "Days",
+                    }
+                ),
                 hide_index=True,
                 use_container_width=True,
             )
     with c2:
-        st.markdown("**Top losers**")
+        st.markdown("**Worst performers**")
         if losers.empty:
-            st.caption("None yet")
+            st.caption("—")
         else:
-            bottom = losers.nsmallest(5, "pl_pct")[["symbol", "pl_pct", "days_held"]]
             st.dataframe(
-                bottom.rename(columns={"symbol": "Symbol", "pl_pct": "P/L %", "days_held": "Days"}),
+                losers.nsmallest(5, "pl_pct")[
+                    ["symbol", "source", "pl_pct", "days_held"]
+                ].rename(
+                    columns={
+                        "symbol": "Symbol",
+                        "source": "Bought From",
+                        "pl_pct": "P/L %",
+                        "days_held": "Days",
+                    }
+                ),
                 hide_index=True,
                 use_container_width=True,
             )
