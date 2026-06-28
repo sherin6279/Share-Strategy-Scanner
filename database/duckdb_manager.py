@@ -53,6 +53,8 @@ class DuckDBManager:
         return self._conn
 
     def _initialize_schema(self) -> None:
+        if self._conn is None:
+            return
         schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
         self._conn.execute(schema_sql)
         if not self.read_only:
@@ -512,6 +514,145 @@ class DuckDBManager:
         if ts is None:
             return pd.DataFrame()
         return self.get_fno_scan_results(scan_timestamp=ts)
+
+    def insert_paper_trade_batch(
+        self,
+        batch_id: str,
+        scan_run_id: str | None,
+        created_at: datetime,
+        entry_date: date,
+        position_count: int,
+        notes: str = "",
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO paper_trade_batches
+            (batch_id, scan_run_id, created_at, entry_date, position_count, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [batch_id, scan_run_id, created_at, entry_date, position_count, notes],
+        )
+
+    def insert_paper_trade_positions(self, positions: list[dict[str, Any]]) -> int:
+        if not positions:
+            return 0
+        rows = [
+            (
+                p["position_id"],
+                p["batch_id"],
+                p["symbol"],
+                p["strategy_id"],
+                p["entry_date"],
+                p["entry_price"],
+                p["score"],
+            )
+            for p in positions
+        ]
+        self.conn.executemany(
+            """
+            INSERT INTO paper_trade_positions
+            (position_id, batch_id, symbol, strategy_id, entry_date, entry_price, score)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        return len(rows)
+
+    def get_paper_trade_batch(self, batch_id: str) -> dict | None:
+        row = self.conn.execute(
+            """
+            SELECT batch_id, scan_run_id, created_at, entry_date, position_count, notes
+            FROM paper_trade_batches WHERE batch_id = ?
+            """,
+            [batch_id],
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "batch_id": row[0],
+            "scan_run_id": row[1],
+            "created_at": row[2],
+            "entry_date": row[3],
+            "position_count": row[4],
+            "notes": row[5] or "",
+        }
+
+    def get_paper_trade_batch_by_scan(self, scan_run_id: str) -> dict | None:
+        row = self.conn.execute(
+            """
+            SELECT batch_id, scan_run_id, created_at, entry_date, position_count, notes
+            FROM paper_trade_batches WHERE scan_run_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [scan_run_id],
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "batch_id": row[0],
+            "scan_run_id": row[1],
+            "created_at": row[2],
+            "entry_date": row[3],
+            "position_count": row[4],
+            "notes": row[5] or "",
+        }
+
+    def list_paper_trade_batches(self, limit: int = 50) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT batch_id, scan_run_id, created_at, entry_date, position_count, notes
+            FROM paper_trade_batches
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+        return [
+            {
+                "batch_id": r[0],
+                "scan_run_id": r[1],
+                "created_at": r[2],
+                "entry_date": r[3],
+                "position_count": r[4],
+                "notes": r[5] or "",
+            }
+            for r in rows
+        ]
+
+    def get_paper_trade_positions(self, batch_id: str) -> pd.DataFrame:
+        return self.conn.execute(
+            """
+            SELECT position_id, batch_id, symbol, strategy_id, entry_date,
+                   entry_price, score
+            FROM paper_trade_positions
+            WHERE batch_id = ?
+            ORDER BY symbol, strategy_id
+            """,
+            [batch_id],
+        ).fetchdf()
+
+    def get_latest_closes(self, symbols: list[str]) -> dict[str, tuple[date, float]]:
+        """Return latest (trade_date, close) per symbol from stored candles."""
+        if not symbols:
+            return {}
+        placeholders = ", ".join(["?"] * len(symbols))
+        df = self.conn.execute(
+            f"""
+            SELECT symbol, trade_date, close
+            FROM candles
+            WHERE symbol IN ({placeholders})
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY trade_date DESC) = 1
+            """,
+            symbols,
+        ).fetchdf()
+        result: dict[str, tuple[date, float]] = {}
+        for _, row in df.iterrows():
+            td = row["trade_date"]
+            if hasattr(td, "date"):
+                td = td.date()
+            result[row["symbol"]] = (td, float(row["close"]))
+        return result
 
     def save_backtest_run(
         self,

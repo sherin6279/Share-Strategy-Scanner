@@ -80,3 +80,27 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
 
 CREATE INDEX IF NOT EXISTS idx_intraday_symbol ON candles_intraday(symbol);
 CREATE INDEX IF NOT EXISTS idx_intraday_dt ON candles_intraday(trade_datetime);
+
+-- Paper trading: snapshot scan picks at entry prices, track real P/L later
+CREATE TABLE IF NOT EXISTS paper_trade_batches (
+    batch_id VARCHAR PRIMARY KEY,
+    scan_run_id VARCHAR,
+    created_at TIMESTAMP,
+    entry_date DATE,
+    position_count INTEGER,
+    notes VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS paper_trade_positions (
+    position_id VARCHAR PRIMARY KEY,
+    batch_id VARCHAR,
+    symbol VARCHAR,
+    strategy_id INTEGER,
+    entry_date DATE,
+    entry_price DOUBLE,
+    score DOUBLE,
+    UNIQUE(batch_id, symbol, strategy_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_positions_batch ON paper_trade_positions(batch_id);
+CREATE INDEX IF NOT EXISTS idx_paper_batches_scan ON paper_trade_batches(scan_run_id);

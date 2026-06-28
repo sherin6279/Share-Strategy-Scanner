@@ -20,6 +20,8 @@ from exports.export_service import export_csv, export_excel, prepare_display_df
 from scanners.scanner import Scanner
 from strategies.strategy_engine import STRATEGIES
 from ui.pages_extra import render_backtest_page, render_fno_page
+from ui.paper_trading_page import render_paper_trading_page
+from paper_trading.service import PaperTradingService
 
 # Page config
 st.set_page_config(
@@ -293,6 +295,19 @@ def _run_scan(db: DuckDBManager) -> None:
                     "NIFTY 50 is below its 200-day SMA — Strategies 4–7 still run "
                     "but signals are tagged with a caution note"
                 )
+
+            try:
+                paper = PaperTradingService(db=db).record_from_scan(summary["scan_run_id"])
+                if paper.get("already_recorded"):
+                    st.caption(f"Paper trade batch already saved ({paper['position_count']} picks)")
+                else:
+                    st.caption(
+                        f"Paper trade: saved {paper['position_count']} picks at entry prices "
+                        f"(batch `{paper['batch_id']}`)"
+                    )
+            except Exception as paper_exc:
+                st.warning(f"Paper trade not saved: {paper_exc}")
+
             st.rerun()
         except Exception as exc:
             st.error(f"Scan failed: {exc}")
@@ -431,14 +446,13 @@ def main() -> None:
 
     try:
         db = get_db()
-        db._initialize_schema()
     except RuntimeError as exc:
         st.error(str(exc))
         st.stop()
 
     mode = st.sidebar.radio(
         "Segment",
-        ["Equity", "F&O Intraday", "Backtest"],
+        ["Equity", "Paper Trading", "F&O Intraday", "Backtest"],
         index=0,
     )
 
@@ -478,6 +492,8 @@ def main() -> None:
             render_confluence_tab(
                 scanner, scan_run_id=scan_run_id, scan_timestamp=scan_ts
             )
+    elif mode == "Paper Trading":
+        render_paper_trading_page(db)
     elif mode == "F&O Intraday":
         render_fno_page(db, get_fetcher)
     else:
@@ -490,6 +506,8 @@ def main() -> None:
         st.write(f"NIFTY 50 loaded: {NIFTY50_SYMBOL in symbols}")
         fno_syms = db.get_intraday_symbols()
         st.write(f"F&O intraday symbols: {len(fno_syms)}")
+        paper_batches = db.list_paper_trade_batches(limit=5)
+        st.write(f"Paper trade batches: {len(paper_batches)}")
         if st.session_state.refresh_summary:
             st.json(st.session_state.refresh_summary)
 
