@@ -217,3 +217,52 @@ class KiteFetcher:
                 results.append(df)
 
         return results, failed
+
+    def fetch_ltp(self, symbols: list[str], batch_size: int = 400) -> dict[str, float]:
+        """
+        Fetch last traded price for NSE equity symbols via Kite.
+
+        Returns tradingsymbol -> last_price.
+        """
+        if not symbols:
+            return {}
+
+        if not self._instrument_map:
+            self.load_instruments()
+
+        keys: list[str] = []
+        key_to_symbol: dict[str, str] = {}
+        for symbol in symbols:
+            if self.get_token(symbol) is None:
+                continue
+            key = f"NSE:{symbol}"
+            keys.append(key)
+            key_to_symbol[key] = symbol
+
+        if not keys:
+            return {}
+
+        prices: dict[str, float] = {}
+        for i in range(0, len(keys), batch_size):
+            batch = keys[i : i + batch_size]
+            for attempt in range(1, RETRY_COUNT + 1):
+                try:
+                    self._rate_limit()
+                    quotes = self.kite.ltp(batch)
+                    for key, payload in quotes.items():
+                        symbol = key_to_symbol.get(key)
+                        if symbol and payload.get("last_price") is not None:
+                            prices[symbol] = float(payload["last_price"])
+                    break
+                except Exception as exc:
+                    logger.warning(
+                        "LTP fetch failed (batch %d, attempt %d/%d): %s",
+                        i // batch_size + 1,
+                        attempt,
+                        RETRY_COUNT,
+                        exc,
+                    )
+                    if attempt < RETRY_COUNT:
+                        time.sleep(REQUEST_DELAY_SEC * attempt)
+
+        return prices

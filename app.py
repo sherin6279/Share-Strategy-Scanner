@@ -537,7 +537,7 @@ def main() -> None:
                 scanner, scan_run_id=scan_run_id, scan_timestamp=scan_ts
             )
     elif mode == "Portfolio":
-        render_paper_trading_page(db)
+        render_paper_trading_page(db, get_fetcher)
     elif mode == "F&O Intraday":
         render_fno_page(db, get_fetcher)
     else:

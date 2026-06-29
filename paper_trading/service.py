@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 
 from config.settings import MAX_SHARE_PRICE_INR, RS_LEADERS_MAX_PICKS
+from data.kite_fetcher import KiteFetcher
 from database.duckdb_manager import DuckDBManager
 from scanners.signal_filters import apply_scan_df_filters
 from strategies.strategy_6_relative_strength_leaders import STRATEGY_ID as RS_LEADERS_ID
@@ -361,14 +362,18 @@ class PaperTradingService:
             return "Confluence"
         return source_label
 
-    def get_portfolio(self) -> pd.DataFrame:
-        """All holdings marked to market with P/L as of latest stored prices."""
+    def get_portfolio(
+        self,
+        price_overrides: dict[str, tuple[date, float]] | None = None,
+    ) -> pd.DataFrame:
+        """All holdings marked to market with P/L as of stored or overridden prices."""
         holdings = self.db.list_portfolio_holdings()
         if holdings.empty:
             return pd.DataFrame()
 
         symbols = holdings["symbol"].unique().tolist()
         latest_closes = self.db.get_latest_closes(symbols)
+        overrides = price_overrides or {}
 
         rows: list[dict[str, Any]] = []
         for _, h in holdings.iterrows():
@@ -391,11 +396,17 @@ class PaperTradingService:
             pl_amount: float | None = None
             pl_pct: float | None = None
             days_held = 0
+            price_source = "stored"
 
-            if symbol in latest_closes:
+            if symbol in overrides:
+                current_date, current_price = overrides[symbol]
+                price_source = "live"
+            elif symbol in latest_closes:
                 current_date, current_price = latest_closes[symbol]
+
+            if current_date is not None and current_price is not None:
                 days_held = max(0, (current_date - purchase_date).days)
-                if current_date >= purchase_date and current_price is not None:
+                if current_date >= purchase_date:
                     market_value = current_price * qty
                     pl_amount = market_value - cost_basis
                     pl_pct = (pl_amount / cost_basis) * 100.0 if cost_basis else None
@@ -424,6 +435,7 @@ class PaperTradingService:
                     "days_held": days_held,
                     "pl_amount": pl_amount,
                     "pl_pct": pl_pct,
+                    "price_source": price_source,
                     "score": float(h["score"]) if pd.notna(h["score"]) else None,
                     "scan_run_id": h["scan_run_id"],
                 }
@@ -431,8 +443,31 @@ class PaperTradingService:
 
         return pd.DataFrame(rows)
 
-    def summarize_portfolio(self) -> dict[str, Any]:
-        df = self.get_portfolio()
+    def fetch_live_prices(
+        self,
+        fetcher: KiteFetcher,
+    ) -> tuple[dict[str, tuple[date, float]], list[str]]:
+        """Pull current LTP from Kite for all portfolio symbols."""
+        if not fetcher.is_authenticated():
+            raise RuntimeError("Kite not authenticated. Log in via the sidebar.")
+
+        if not fetcher.validate_token():
+            raise RuntimeError("Kite access token is invalid or expired.")
+
+        holdings = self.db.list_portfolio_holdings()
+        if holdings.empty:
+            return {}, []
+
+        symbols = holdings["symbol"].unique().tolist()
+        ltp = fetcher.fetch_ltp(symbols)
+        failed = [s for s in symbols if s not in ltp]
+        as_of = date.today()
+        overrides = {symbol: (as_of, price) for symbol, price in ltp.items()}
+        logger.info("Fetched live LTP for %d/%d portfolio symbols", len(overrides), len(symbols))
+        return overrides, failed
+
+    def summarize_portfolio(self, df: pd.DataFrame | None = None) -> dict[str, Any]:
+        df = df if df is not None else self.get_portfolio()
         if df.empty:
             return {
                 "holding_count": 0,
@@ -458,6 +493,7 @@ class PaperTradingService:
         flat = int((priced["pl_amount"] == 0).sum())
         win_rate = (winners / len(priced) * 100.0) if len(priced) else None
         avg_pl_pct = float(priced["pl_pct"].mean()) if len(priced) else None
+        live_count = int((priced["price_source"] == "live").sum()) if "price_source" in priced else 0
 
         return {
             "holding_count": len(df),
@@ -475,6 +511,8 @@ class PaperTradingService:
             "win_rate": win_rate,
             "latest_price_date": priced["current_date"].max() if len(priced) else None,
             "symbols": df["symbol"].nunique(),
+            "live_price_count": live_count,
+            "using_live_prices": live_count > 0 and live_count == len(priced),
         }
 
     def summarize_by_date(self, df: pd.DataFrame | None = None) -> pd.DataFrame:

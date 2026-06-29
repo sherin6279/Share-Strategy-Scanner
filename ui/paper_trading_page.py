@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
@@ -10,6 +12,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config.settings import MAX_SHARE_PRICE_INR
+from data.kite_fetcher import KiteFetcher
 from database.duckdb_manager import DuckDBManager
 from paper_trading.service import PaperTradingService
 
@@ -145,6 +148,58 @@ def _stat_card(
     )
 
 
+def _fmt_datetime(ts: str | datetime | None) -> str:
+    if ts is None:
+        return "—"
+    if isinstance(ts, str):
+        ts = datetime.fromisoformat(ts)
+    return ts.strftime("%d %b %Y, %H:%M")
+
+
+def _live_price_overrides() -> dict[str, tuple[date, float]] | None:
+    overrides = st.session_state.get("portfolio_live_prices")
+    return overrides if overrides else None
+
+
+def _fetch_live_pl(service: PaperTradingService, get_fetcher: Callable[[], KiteFetcher]) -> None:
+    with st.spinner("Fetching live prices from Kite…"):
+        try:
+            overrides, failed = service.fetch_live_prices(get_fetcher())
+            st.session_state["portfolio_live_prices"] = overrides
+            st.session_state["portfolio_live_fetched_at"] = datetime.now().isoformat()
+            st.session_state["portfolio_live_failed"] = failed
+            if overrides:
+                st.success(f"Updated P/L for {len(overrides)} symbol(s) at market price.")
+            if failed:
+                st.warning(
+                    f"Could not fetch live price for {len(failed)} symbol(s): "
+                    f"{', '.join(failed[:8])}"
+                    + ("…" if len(failed) > 8 else "")
+                )
+        except Exception as exc:
+            st.error(str(exc))
+
+
+def _render_price_source_caption(summary: dict) -> None:
+    fetched_at = st.session_state.get("portfolio_live_fetched_at")
+    if summary.get("using_live_prices") and fetched_at:
+        st.caption(
+            f"**Live P/L** from Kite LTP — fetched {_fmt_datetime(fetched_at)}"
+        )
+    elif summary.get("live_price_count", 0) > 0 and fetched_at:
+        st.caption(
+            f"**Mixed pricing** — {summary['live_price_count']} live, "
+            f"{summary.get('unpriced_count', 0)} missing — "
+            f"fetched {_fmt_datetime(fetched_at)}"
+        )
+    else:
+        st.caption(
+            f"Prices from last **Refresh Market Data** — as of "
+            f"**{_fmt_date(summary['latest_price_date'])}**. "
+            f"Click **Update live P/L** for current Kite prices."
+        )
+
+
 def _render_summary_cards(summary: dict) -> None:
     pl = summary["total_pl_amount"]
     pl_pct = summary["total_pl_pct"]
@@ -155,7 +210,8 @@ def _render_summary_cards(summary: dict) -> None:
     with c1:
         _stat_card("Invested", _fmt_inr(summary["total_cost"]), "Total buy value")
     with c2:
-        _stat_card("Market value", _fmt_inr(summary["total_market_value"]), "As of latest prices")
+        mv_label = "Live market value" if summary.get("using_live_prices") else "As of latest prices"
+        _stat_card("Market value", _fmt_inr(summary["total_market_value"]), mv_label)
     with c3:
         _stat_card(
             "Total P/L",
@@ -357,7 +413,9 @@ def render_portfolio_sidebar(db: DuckDBManager) -> None:
         st.sidebar.warning(f"{pending} scan(s) waiting to sync")
 
     service = PaperTradingService(db=db)
-    summary = service.summarize_portfolio()
+    overrides = _live_price_overrides()
+    df = service.get_portfolio(price_overrides=overrides)
+    summary = service.summarize_portfolio(df)
 
     if summary["holding_count"] == 0:
         st.sidebar.caption("No holdings yet. Run a scan to add picks.")
@@ -371,9 +429,13 @@ def render_portfolio_sidebar(db: DuckDBManager) -> None:
         _fmt_inr(pl, signed=True),
         delta=f"{pl_pct:+.2f}%" if pl_pct is not None else None,
     )
-    st.sidebar.caption(f"Prices as of {_fmt_date(summary['latest_price_date'])}")
+    st.sidebar.caption(
+        f"Live P/L · {_fmt_datetime(st.session_state['portfolio_live_fetched_at'])}"
+        if overrides and st.session_state.get("portfolio_live_fetched_at")
+        else f"Prices as of {_fmt_date(summary['latest_price_date'])}"
+    )
 
-    by_date = service.summarize_by_date()
+    by_date = service.summarize_by_date(df)
     if not by_date.empty:
         st.sidebar.markdown("**Recent scan dates**")
         for _, row in by_date.head(4).iterrows():
@@ -555,7 +617,10 @@ def render_sync_feedback(sync: dict[str, Any], *, always_show: bool = False) -> 
         )
 
 
-def render_paper_trading_page(db: DuckDBManager) -> None:
+def render_paper_trading_page(
+    db: DuckDBManager,
+    get_fetcher: Callable[[], KiteFetcher],
+) -> None:
     _inject_styles()
 
     st.markdown(
@@ -563,7 +628,7 @@ def render_paper_trading_page(db: DuckDBManager) -> None:
         <div class="pf-hero">
             <h2>Portfolio</h2>
             <p>Scan picks grouped by date and strategy. One share per symbol per day,
-            max ₹{MAX_SHARE_PRICE_INR:,.0f} per share. Refresh market data on the Equity tab to update live prices.</p>
+            max ₹{MAX_SHARE_PRICE_INR:,.0f} per share. Use <b>Update live P/L</b> for current Kite prices.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -571,23 +636,32 @@ def render_paper_trading_page(db: DuckDBManager) -> None:
 
     service = PaperTradingService(db=db)
     pending = db.count_unprocessed_equity_scan_runs()
-    hero_cols = st.columns([3, 1])
+    hero_cols = st.columns([2, 1, 1])
     with hero_cols[1]:
-        sync_clicked = st.button("Sync from scans", use_container_width=True, type="primary")
+        sync_clicked = st.button("Sync from scans", use_container_width=True)
+    with hero_cols[2]:
+        live_clicked = st.button("Update live P/L", use_container_width=True, type="primary")
     if pending > 0 and not sync_clicked:
         st.caption(f"{pending} saved scan(s) not yet in the portfolio — syncing now…")
+
+    if live_clicked:
+        _fetch_live_pl(service, get_fetcher)
 
     sync = service.sync_portfolio_from_scans()
     render_sync_feedback(sync, always_show=sync_clicked)
 
-    summary = service.summarize_portfolio()
+    overrides = _live_price_overrides()
+    df = service.get_portfolio(price_overrides=overrides)
+    summary = service.summarize_portfolio(df)
 
     if summary["holding_count"] == 0:
         st.info("No holdings yet. Run an **Equity** scan — picks are added automatically.")
         return
 
     if summary["holding_count"] > 0 and summary["total_market_value"] == 0:
-        st.warning("Refresh market data on the Equity tab to load current prices.")
+        st.warning(
+            "No stored prices yet. Click **Update live P/L** or refresh market data on the Equity tab."
+        )
 
     _render_summary_cards(summary)
 
@@ -602,9 +676,8 @@ def render_paper_trading_page(db: DuckDBManager) -> None:
             """
         )
 
-    st.caption(f"Live prices as of **{_fmt_date(summary['latest_price_date'])}**")
+    _render_price_source_caption(summary)
 
-    df = service.get_portfolio()
     date_options = ["All dates"] + [
         _fmt_date(d) for d in sorted(df["purchase_date"].unique(), reverse=True)
     ]

@@ -409,6 +409,20 @@ def test_sync_skips_empty_scan_runs(paper_db):
     assert paper_db.portfolio_scan_processed("empty_scan")
 
 
+def test_portfolio_live_price_overrides(paper_db):
+    svc = PaperTradingService(db=paper_db)
+    svc.record_from_scan("scan1")
+    today = date(2025, 6, 28)
+    overrides = {"RELIANCE": (today, 1200.0), "TCS": (today, 1100.0)}
+    df = svc.get_portfolio(price_overrides=overrides)
+    reliance = df[df["symbol"] == "RELIANCE"].iloc[0]
+    assert reliance["current_price"] == 1200.0
+    assert reliance["price_source"] == "live"
+    summary = svc.summarize_portfolio(df)
+    assert summary["using_live_prices"] is True
+    assert summary["total_pl_amount"] != 0
+
+
 def test_summarize_by_date_and_strategy(paper_db):
     svc = PaperTradingService(db=paper_db)
     svc.record_from_scan("scan1")
